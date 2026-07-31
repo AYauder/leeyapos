@@ -904,9 +904,10 @@ function CashDrawerCard({ cashDrawer, setCashDrawer, sales, expenses, setExpense
 }
 
 /* ---------- Ticket edit modal: add/remove services, or add a custom charge ---------- */
-function TicketEditModal({ ticket, catalog, onSave, onClose }) {
-  const [items, setItems] = useState(ticket.items.map((i) => Object.assign({}, i)));
+function TicketEditModal({ ticket, catalog, staff, onSave, onClose }) {
+  const [items, setItems] = useState(ticket.items.map((i) => Object.assign({ staffId: ticket.staffId, staffName: ticket.staffName }, i)));
   const [addCatalogId, setAddCatalogId] = useState("");
+  const [addStaffId, setAddStaffId] = useState(ticket.staffId);
   const [customDesc, setCustomDesc] = useState("");
   const [customAmount, setCustomAmount] = useState("");
 
@@ -915,47 +916,66 @@ function TicketEditModal({ ticket, catalog, onSave, onClose }) {
   const changeQty = (idx, delta) => {
     setItems((prev) => prev.map((it, i) => (i === idx ? Object.assign({}, it, { qty: it.qty + delta }) : it)).filter((it) => it.qty > 0));
   };
+  const changeStaff = (idx, newStaffId) => {
+    const staffMember = staff.find((s) => s.id === newStaffId);
+    setItems((prev) => prev.map((it, i) => (i === idx ? Object.assign({}, it, { staffId: newStaffId, staffName: staffMember ? staffMember.name : "" }) : it)));
+  };
   const removeAt = (idx) => setItems((prev) => prev.filter((_, i) => i !== idx));
 
   const addFromCatalog = () => {
     const def = catalog.find((c) => c.id === addCatalogId);
     if (!def) return;
+    const staffMember = staff.find((s) => s.id === addStaffId);
     setItems((prev) => {
-      const existing = prev.find((p) => p.catalogId === def.id && p.type === def.type);
+      const existing = prev.find((p) => p.catalogId === def.id && p.type === def.type && p.staffId === addStaffId);
       if (existing) return prev.map((p) => (p === existing ? Object.assign({}, p, { qty: p.qty + 1 }) : p));
-      return prev.concat([{ catalogId: def.id, name: def.name, price: def.price, qty: 1, type: def.type, kind: null, packageId: null }]);
+      return prev.concat([{ catalogId: def.id, name: def.name, price: def.price, qty: 1, type: def.type, kind: null, packageId: null, staffId: addStaffId, staffName: staffMember ? staffMember.name : "" }]);
     });
   };
 
   const addCustom = () => {
     if (!customDesc.trim() || customAmount === "") return;
-    setItems((prev) => prev.concat([{ catalogId: null, name: customDesc.trim(), price: Number(customAmount) || 0, qty: 1, type: "custom", kind: "custom", packageId: null }]));
+    const staffMember = staff.find((s) => s.id === addStaffId);
+    setItems((prev) => prev.concat([{ catalogId: null, name: customDesc.trim(), price: Number(customAmount) || 0, qty: 1, type: "custom", kind: "custom", packageId: null, staffId: addStaffId, staffName: staffMember ? staffMember.name : "" }]));
     setCustomDesc("");
     setCustomAmount("");
   };
 
   return (
     <Modal title="Edit ticket" onClose={onClose} wide>
-      <div style={{ maxHeight: 220, overflowY: "auto", marginBottom: 12 }}>
+      <div style={{ maxHeight: 260, overflowY: "auto", marginBottom: 12 }}>
         {items.map((i, idx) => {
           const meta = TYPE_META[i.type] || TYPE_META.service;
           return (
-            <div key={idx} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "8px 0", borderBottom: "1px solid " + LINE }}>
-              <div style={{ flex: 1 }}>
-                <div style={{ fontSize: 13, fontWeight: 600 }}>{i.name} <span style={{ fontSize: 11, color: meta.color }}>{meta.label}</span></div>
-                <div style={{ fontSize: 12, color: MUTED }}>{peso(i.price)} each</div>
+            <div key={idx} style={{ padding: "8px 0", borderBottom: "1px solid " + LINE }}>
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                <div style={{ flex: 1 }}>
+                  <div style={{ fontSize: 13, fontWeight: 600 }}>{i.name} <span style={{ fontSize: 11, color: meta.color }}>{meta.label}</span></div>
+                  <div style={{ fontSize: 12, color: MUTED }}>{peso(i.price)} each</div>
+                </div>
+                <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                  <span onClick={() => changeQty(idx, -1)} style={{ cursor: "pointer", width: 22, textAlign: "center", border: "1px solid " + LINE, borderRadius: 6 }}>-</span>
+                  <span style={{ minWidth: 16, textAlign: "center", fontSize: 13 }}>{i.qty}</span>
+                  <span onClick={() => changeQty(idx, 1)} style={{ cursor: "pointer", width: 22, textAlign: "center", border: "1px solid " + LINE, borderRadius: 6 }}>+</span>
+                  <span onClick={() => removeAt(idx)} style={{ cursor: "pointer", color: RUST, marginLeft: 6 }}>&times;</span>
+                </div>
               </div>
-              <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
-                <span onClick={() => changeQty(idx, -1)} style={{ cursor: "pointer", width: 22, textAlign: "center", border: "1px solid " + LINE, borderRadius: 6 }}>-</span>
-                <span style={{ minWidth: 16, textAlign: "center", fontSize: 13 }}>{i.qty}</span>
-                <span onClick={() => changeQty(idx, 1)} style={{ cursor: "pointer", width: 22, textAlign: "center", border: "1px solid " + LINE, borderRadius: 6 }}>+</span>
-                <span onClick={() => removeAt(idx)} style={{ cursor: "pointer", color: RUST, marginLeft: 6 }}>&times;</span>
-              </div>
+              {i.type === "service" && (
+                <select style={Object.assign({}, inputStyle, { marginTop: 4, padding: "5px 8px", fontSize: 12 })} value={i.staffId || ""} onChange={(e) => changeStaff(idx, e.target.value)}>
+                  {staff.filter((s) => s.active !== false).map((s) => (<option key={s.id} value={s.id}>{s.name}</option>))}
+                </select>
+              )}
             </div>
           );
         })}
         {items.length === 0 && <div style={{ fontSize: 13, color: MUTED }}>No items on this ticket.</div>}
       </div>
+
+      <Field label="Staff for new items">
+        <select style={inputStyle} value={addStaffId} onChange={(e) => setAddStaffId(e.target.value)}>
+          {staff.filter((s) => s.active !== false).map((s) => (<option key={s.id} value={s.id}>{s.name}</option>))}
+        </select>
+      </Field>
 
       <Field label="Add existing item from catalog">
         <div style={{ display: "flex", gap: 8 }}>
@@ -1011,13 +1031,25 @@ function POSTab(props) {
   const filtered = search.trim() ? byCategory.filter((c) => c.name.toLowerCase().indexOf(search.trim().toLowerCase()) !== -1) : byCategory;
 
   const addToCart = (item) => {
+    const staffMember = staff.find((s) => s.id === assignedStaffId);
+    const staffName = staffMember ? staffMember.name : "";
+    const catalogId = item.catalogId !== undefined ? item.catalogId : item.id;
+    const mergeKey = catalogId + "|" + (item.kind || "") + "|" + (item.packageId || "");
     setCart((prev) => {
-      const existing = prev.find((p) => p.id === item.id);
-      if (existing) return prev.map((p) => (p.id === item.id ? Object.assign({}, p, { qty: p.qty + 1 }) : p));
-      return prev.concat([Object.assign({}, item, { catalogId: item.catalogId !== undefined ? item.catalogId : item.id, qty: 1 })]);
+      const existing = prev.find((p) => p.mergeKey === mergeKey && p.staffId === assignedStaffId);
+      if (existing) return prev.map((p) => (p === existing ? Object.assign({}, p, { qty: p.qty + 1 }) : p));
+      return prev.concat([{
+        lineId: uid(), mergeKey, catalogId, name: item.name, price: item.price, type: item.type,
+        kind: item.kind || null, packageId: item.packageId || null, qty: 1,
+        staffId: assignedStaffId, staffName: staffName,
+      }]);
     });
   };
-  const changeQty = (id, delta) => setCart((prev) => prev.map((p) => (p.id === id ? Object.assign({}, p, { qty: p.qty + delta }) : p)).filter((p) => p.qty > 0));
+  const changeQty = (lineId, delta) => setCart((prev) => prev.map((p) => (p.lineId === lineId ? Object.assign({}, p, { qty: p.qty + delta }) : p)).filter((p) => p.qty > 0));
+  const changeItemStaff = (lineId, newStaffId) => {
+    const staffMember = staff.find((s) => s.id === newStaffId);
+    setCart((prev) => prev.map((p) => (p.lineId === lineId ? Object.assign({}, p, { staffId: newStaffId, staffName: staffMember ? staffMember.name : "" }) : p)));
+  };
 
   const subtotal = cart.reduce((s, i) => s + i.price * i.qty, 0);
   const hasService = cart.some((i) => i.type === "service");
@@ -1091,7 +1123,7 @@ function POSTab(props) {
     const staffMember = staff.find((s) => s.id === assignedStaffId) || currentUser;
     const customer = customers.find((c) => c.id === customerId);
     finalizeSale({
-      items: cart.map((i) => ({ catalogId: i.catalogId, name: i.name, price: i.price, qty: i.qty, type: i.type, kind: i.kind || null, packageId: i.packageId || null })),
+      items: cart.map((i) => ({ catalogId: i.catalogId, name: i.name, price: i.price, qty: i.qty, type: i.type, kind: i.kind || null, packageId: i.packageId || null, staffId: i.staffId, staffName: i.staffName })),
       subtotal: subtotal, discountType: discountType, discountValue: discountValue, discountReason: discountReason, discountAmount: discountAmount, total: finalTotal,
       paymentMethod: payment, amountTendered: tenderedNum, changeDue: changeDue,
       staffMember: staffMember, customer: customer,
@@ -1105,7 +1137,7 @@ function POSTab(props) {
     const customer = customers.find((c) => c.id === customerId);
     const ticket = {
       id: uid(), createdAt: new Date().toISOString(),
-      items: cart.map((i) => ({ catalogId: i.catalogId, name: i.name, price: i.price, qty: i.qty, type: i.type, kind: i.kind || null, packageId: i.packageId || null })),
+      items: cart.map((i) => ({ catalogId: i.catalogId, name: i.name, price: i.price, qty: i.qty, type: i.type, kind: i.kind || null, packageId: i.packageId || null, staffId: i.staffId, staffName: i.staffName })),
       total: subtotal, staffId: staffMember.id, staffName: staffMember.name,
       customerId: customer ? customer.id : null, customerName: customer ? customer.name : "Walk-in", status: "pending",
     };
@@ -1195,8 +1227,8 @@ function POSTab(props) {
                   <div key={t.id} style={{ background: CARD, border: "1px solid " + LINE, borderRadius: 12, padding: 12, display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 10 }}>
                     <div>
                       <div style={{ fontWeight: 700, fontSize: 14 }}>{t.customerName} <Badge text={meta.label} color={meta.color} /></div>
-                      <div style={{ fontSize: 12, color: MUTED }}>{t.items.map((i) => i.qty + "× " + i.name).join(", ")}</div>
-                      <div style={{ fontSize: 12, color: MUTED }}>Staff: {t.staffName} · {peso(t.total)}</div>
+                      <div style={{ fontSize: 12, color: MUTED }}>{t.items.map((i) => i.qty + "× " + i.name + (i.staffName ? " (" + i.staffName + ")" : "")).join(", ")}</div>
+                      <div style={{ fontSize: 12, color: MUTED }}>{peso(t.total)}</div>
                     </div>
                     <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
                       <Btn onClick={() => setEditingTicket(t)}>Edit</Btn>
@@ -1216,16 +1248,23 @@ function POSTab(props) {
           {cart.length === 0 && <div style={{ color: MUTED, fontSize: 13 }}>Tap items to add them here.</div>}
           <div style={{ maxHeight: 220, overflowY: "auto" }}>
             {cart.map((i) => (
-              <div key={i.id} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "8px 0", borderBottom: "1px solid " + LINE }}>
-                <div style={{ flex: 1 }}>
-                  <div style={{ fontSize: 13, fontWeight: 600 }}>{i.name}</div>
-                  <div style={{ fontSize: 12, color: MUTED }}>{peso(i.price)} each</div>
+              <div key={i.lineId} style={{ padding: "8px 0", borderBottom: "1px solid " + LINE }}>
+                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                  <div style={{ flex: 1 }}>
+                    <div style={{ fontSize: 13, fontWeight: 600 }}>{i.name}</div>
+                    <div style={{ fontSize: 12, color: MUTED }}>{peso(i.price)} each</div>
+                  </div>
+                  <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                    <span onClick={() => changeQty(i.lineId, -1)} style={{ cursor: "pointer", width: 22, textAlign: "center", border: "1px solid " + LINE, borderRadius: 6 }}>-</span>
+                    <span style={{ minWidth: 16, textAlign: "center", fontSize: 13 }}>{i.qty}</span>
+                    <span onClick={() => changeQty(i.lineId, 1)} style={{ cursor: "pointer", width: 22, textAlign: "center", border: "1px solid " + LINE, borderRadius: 6 }}>+</span>
+                  </div>
                 </div>
-                <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
-                  <span onClick={() => changeQty(i.id, -1)} style={{ cursor: "pointer", width: 22, textAlign: "center", border: "1px solid " + LINE, borderRadius: 6 }}>-</span>
-                  <span style={{ minWidth: 16, textAlign: "center", fontSize: 13 }}>{i.qty}</span>
-                  <span onClick={() => changeQty(i.id, 1)} style={{ cursor: "pointer", width: 22, textAlign: "center", border: "1px solid " + LINE, borderRadius: 6 }}>+</span>
-                </div>
+                {i.type === "service" && (
+                  <select style={Object.assign({}, inputStyle, { marginTop: 4, padding: "5px 8px", fontSize: 12 })} value={i.staffId} onChange={(e) => changeItemStaff(i.lineId, e.target.value)}>
+                    {staff.filter((s) => s.active !== false).map((s) => (<option key={s.id} value={s.id}>{s.name}</option>))}
+                  </select>
+                )}
               </div>
             ))}
           </div>
@@ -1244,7 +1283,7 @@ function POSTab(props) {
             </div>
           )}
 
-          <Field label="Staff for this sale">
+          <Field label="Default staff for new items" hint="Applied to items as you add them. Change the staff on any line above individually if more than one person is doing the work.">
             <select style={inputStyle} value={assignedStaffId} onChange={(e) => setAssignedStaffId(e.target.value)}>
               {staff.filter((s) => s.active !== false).map((s) => (<option key={s.id} value={s.id}>{s.name}</option>))}
             </select>
@@ -1295,7 +1334,10 @@ function POSTab(props) {
           <Modal title="Sale complete" onClose={() => setReceipt(null)}>
             <div style={{ fontSize: 13, color: MUTED, marginBottom: 8 }}>{new Date(receipt.date).toLocaleString("en-PH")}</div>
             {receipt.items.map((i, idx) => (
-              <div key={idx} style={{ display: "flex", justifyContent: "space-between", fontSize: 14, padding: "4px 0" }}><span>{i.qty} × {i.name}</span><span>{peso(i.price * i.qty)}</span></div>
+              <div key={idx} style={{ display: "flex", justifyContent: "space-between", fontSize: 14, padding: "4px 0" }}>
+                <span>{i.qty} × {i.name}{i.staffName ? <span style={{ color: MUTED, fontSize: 12 }}> — {i.staffName}</span> : null}</span>
+                <span>{peso(i.price * i.qty)}</span>
+              </div>
             ))}
             <div style={{ borderTop: "1px solid " + LINE, marginTop: 8, paddingTop: 8 }}>
               <div style={{ display: "flex", justifyContent: "space-between", fontSize: 13, color: MUTED }}><span>Subtotal</span><span>{peso(receipt.subtotal)}</span></div>
@@ -1310,16 +1352,19 @@ function POSTab(props) {
                 </div>
               )}
             </div>
-            <div style={{ fontSize: 12, color: MUTED, marginTop: 8 }}>Staff: {receipt.staffName} · Paid via {receipt.paymentMethod} · Customer: {receipt.customerName}</div>
+            <div style={{ fontSize: 12, color: MUTED, marginTop: 8 }}>Paid via {receipt.paymentMethod} · Customer: {receipt.customerName}</div>
             <Btn variant="primary" style={{ width: "100%", marginTop: 14 }} onClick={() => setReceipt(null)}>Done</Btn>
           </Modal>
         )}
 
         {ticketCheckout && (
           <Modal title="Checkout ticket" onClose={() => setTicketCheckout(null)}>
-            <div style={{ fontSize: 13, color: MUTED, marginBottom: 8 }}>{ticketCheckout.customerName} · {ticketCheckout.staffName}</div>
+            <div style={{ fontSize: 13, color: MUTED, marginBottom: 8 }}>{ticketCheckout.customerName}</div>
             {ticketCheckout.items.map((i, idx) => (
-              <div key={idx} style={{ display: "flex", justifyContent: "space-between", fontSize: 14, padding: "4px 0" }}><span>{i.qty} × {i.name}</span><span>{peso(i.price * i.qty)}</span></div>
+              <div key={idx} style={{ display: "flex", justifyContent: "space-between", fontSize: 14, padding: "4px 0" }}>
+                <span>{i.qty} × {i.name}{i.staffName ? <span style={{ color: MUTED, fontSize: 12 }}> — {i.staffName}</span> : null}</span>
+                <span>{peso(i.price * i.qty)}</span>
+              </div>
             ))}
             <div style={{ display: "flex", justifyContent: "space-between", fontSize: 13, color: MUTED, borderTop: "1px solid " + LINE, marginTop: 8, paddingTop: 8 }}><span>Subtotal</span><span>{peso(ticketSubtotal)}</span></div>
             <Field label="Payment method">
@@ -1346,7 +1391,7 @@ function POSTab(props) {
           </Modal>
         )}
 
-        {editingTicket && <TicketEditModal ticket={editingTicket} catalog={catalog} onSave={saveTicketEdit} onClose={() => setEditingTicket(null)} />}
+        {editingTicket && <TicketEditModal ticket={editingTicket} catalog={catalog} staff={staff} onSave={saveTicketEdit} onClose={() => setEditingTicket(null)} />}
 
         {confirmCancelId && (
           <ConfirmModal title="Cancel this ticket?" body="The customer won't be charged and this ticket will be removed from the queue." confirmLabel="Cancel ticket" onConfirm={() => doCancelTicket(confirmCancelId)} onClose={() => setConfirmCancelId(null)} />
@@ -1786,7 +1831,13 @@ function DailySummary({ range, onRangeChange, sales, catalog, staff, lowStockThr
   const topItems = Object.entries(itemCounts).sort((a, b) => b[1].revenue - a[1].revenue).slice(0, 5);
 
   const byStaff = {};
-  daySales.forEach((s) => { byStaff[s.staffName] = (byStaff[s.staffName] || 0) + s.total; });
+  daySales.forEach((s) => {
+    const ratio = s.subtotal ? s.total / s.subtotal : 1;
+    s.items.forEach((i) => {
+      const name = i.staffName || s.staffName;
+      byStaff[name] = (byStaff[name] || 0) + i.price * i.qty * ratio;
+    });
+  });
 
   const lowStock = catalog.filter((c) => typeof c.stock === "number" && c.stock <= effectiveThreshold(c, lowStockThreshold));
 
@@ -1957,7 +2008,7 @@ function SalesTab({ sales, setSales, catalog, setCatalog, customerPackages, setC
           <div key={s.id} style={{ background: CARD, border: "1px solid " + LINE, borderRadius: 10, padding: "10px 14px", display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 8, opacity: s.voided ? 0.55 : 1 }}>
             <div>
               <div style={{ fontWeight: 600, fontSize: 13 }}>{new Date(s.date).toLocaleString("en-PH")} · {s.customerName} {s.voided && <Badge text="voided" color={RUST} />}</div>
-              <div style={{ fontSize: 12, color: MUTED }}>{s.items.map((i) => i.qty + "x " + i.name).join(", ")} · {s.staffName} · {s.paymentMethod}</div>
+              <div style={{ fontSize: 12, color: MUTED }}>{s.items.map((i) => i.qty + "x " + i.name + (i.staffName ? " (" + i.staffName + ")" : "")).join(", ")} · {s.paymentMethod}</div>
             </div>
             <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
               <div style={{ fontWeight: 700, fontSize: 13 }}>{peso(s.total)}</div>
@@ -2025,10 +2076,20 @@ function StaffTab({ staff, setStaff, sales, catalog, expenses, setExpenses, sett
   const totalDiscounts = salesInRange.reduce((sum, s) => sum + (s.discountAmount || 0), 0);
 
   const commissionRows = staff.map((s) => {
-    const staffSales = salesInRange.filter((sa) => sa.staffId === s.id);
-    const gross = staffSales.reduce((sum, sa) => sum + sa.total, 0);
+    let gross = 0;
+    let count = 0;
+    salesInRange.forEach((sa) => {
+      const ratio = sa.subtotal ? sa.total / sa.subtotal : 1;
+      sa.items.forEach((i) => {
+        const itemStaffId = i.staffId || sa.staffId;
+        if (itemStaffId === s.id) {
+          gross += i.price * i.qty * ratio;
+          count += i.qty;
+        }
+      });
+    });
     const commission = gross * (Number(s.commissionRate) / 100);
-    return { staff: s, gross: gross, commission: commission, count: staffSales.length };
+    return { staff: s, gross: gross, commission: commission, count: count };
   });
 
   const itemAgg = {};
@@ -2047,12 +2108,21 @@ function StaffTab({ staff, setStaff, sales, catalog, expenses, setExpenses, sett
   const expensesTotalRange = expensesInRange.reduce((sum, e) => sum + e.amount, 0);
 
   const exportCSV = () => {
-    const rows = [["Date", "Time", "Customer", "Staff", "Items", "Subtotal", "Discount", "Discount Reason", "Payment", "Total", "Commission Rate %", "Commission", "Voided"]];
+    const rows = [["Date", "Time", "Customer", "Items (staff)", "Subtotal", "Discount", "Discount Reason", "Payment", "Total", "Commission by staff", "Voided"]];
     sales.filter((s) => inRange(s.date, range.start, range.end)).forEach((s) => {
-      const staffMember = staff.find((st) => st.id === s.staffId);
-      const rate = staffMember ? Number(staffMember.commissionRate) || 0 : 0;
-      const commission = s.total * (rate / 100);
-      rows.push([s.date.slice(0, 10), new Date(s.date).toLocaleTimeString("en-PH"), s.customerName, s.staffName, s.items.map((i) => i.qty + "x " + i.name).join("; "), (s.subtotal != null ? s.subtotal : s.total).toFixed(2), (s.discountAmount || 0).toFixed(2), s.discountReason || "", s.paymentMethod, s.total.toFixed(2), rate, commission.toFixed(2), s.voided ? "Yes" : "No"]);
+      const ratio = s.subtotal ? s.total / s.subtotal : 1;
+      const byStaffGross = {};
+      s.items.forEach((i) => {
+        const staffId = i.staffId || s.staffId;
+        const staffMember = staff.find((st) => st.id === staffId);
+        const name = i.staffName || s.staffName || "Unassigned";
+        const rate = staffMember ? Number(staffMember.commissionRate) || 0 : 0;
+        byStaffGross[name] = byStaffGross[name] || { gross: 0, rate: rate };
+        byStaffGross[name].gross += i.price * i.qty * ratio;
+      });
+      const commissionSummary = Object.entries(byStaffGross).map(([name, v]) => name + ": " + peso(v.gross * (v.rate / 100))).join(", ");
+      const itemsSummary = s.items.map((i) => i.qty + "x " + i.name + (i.staffName ? " (" + i.staffName + ")" : "")).join("; ");
+      rows.push([s.date.slice(0, 10), new Date(s.date).toLocaleTimeString("en-PH"), s.customerName, itemsSummary, (s.subtotal != null ? s.subtotal : s.total).toFixed(2), (s.discountAmount || 0).toFixed(2), s.discountReason || "", s.paymentMethod, s.total.toFixed(2), commissionSummary, s.voided ? "Yes" : "No"]);
     });
     downloadCSV("leeya-sales-" + range.start + "-to-" + range.end + ".csv", rows);
   };
@@ -2105,7 +2175,7 @@ function StaffTab({ staff, setStaff, sales, catalog, expenses, setExpenses, sett
         <div style={{ display: "flex", flexDirection: "column", gap: 6, marginBottom: 24 }}>
           {commissionRows.map((r) => (
             <div key={r.staff.id} style={{ background: CARD, border: "1px solid " + LINE, borderRadius: 10, padding: "10px 14px", display: "flex", justifyContent: "space-between", flexWrap: "wrap", gap: 8 }}>
-              <div style={{ fontWeight: 600 }}>{r.staff.name} <span style={{ fontSize: 12, color: MUTED }}>({r.staff.commissionRate}% rate · {r.count} sales)</span></div>
+              <div style={{ fontWeight: 600 }}>{r.staff.name} <span style={{ fontSize: 12, color: MUTED }}>({r.staff.commissionRate}% rate · {r.count} item{r.count === 1 ? "" : "s"})</span></div>
               <div style={{ display: "flex", gap: 16 }}>
                 <div style={{ fontSize: 13, color: MUTED }}>Gross: {peso(r.gross)}</div>
                 <div style={{ fontSize: 13, fontWeight: 700, color: SAGE }}>Commission: {peso(r.commission)}</div>
