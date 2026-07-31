@@ -84,3 +84,5 @@ Vercel redeploys automatically.
 - **Backups.** Use "Download backup" under Staff & Settings regularly —
   it saves everything (sales, customers, catalog, staff, settings) as
   one file you can keep safe or use to restore later.
+
+
