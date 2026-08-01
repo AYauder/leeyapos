@@ -20,7 +20,15 @@ const peso = (n) =>
 
 const uid = () => Math.random().toString(36).slice(2, 10) + Date.now().toString(36).slice(-4);
 
-const todayStr = () => new Date().toISOString().slice(0, 10);
+const localDayFromDate = (d) => {
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, "0");
+  const day = String(d.getDate()).padStart(2, "0");
+  return y + "-" + m + "-" + day;
+};
+const todayStr = () => localDayFromDate(new Date());
+// converts a full ISO timestamp (e.g. a sale's date) to the local calendar day
+const localDayOf = (isoString) => localDayFromDate(new Date(isoString));
 
 const fmtDate = (d) => {
   const dt = new Date(d + "T00:00:00");
@@ -55,7 +63,7 @@ const computeDiscountAmount = (subtotal, type, value) => {
 };
 
 /* ---------- date range presets ---------- */
-const isoDay = (d) => d.toISOString().slice(0, 10);
+const isoDay = (d) => localDayFromDate(d);
 
 function presetRange(preset, customStart, customEnd) {
   const today = new Date();
@@ -145,7 +153,7 @@ function DateRangeFilter({ value, onChange }) {
 }
 const defaultRangeValue = (preset) => { const r = presetRange(preset || "today"); return { preset: preset || "today", start: r.start, end: r.end }; };
 const inRange = (dateIso, start, end) => {
-  const d = dateIso.slice(0, 10);
+  const d = dateIso.length > 10 ? localDayOf(dateIso) : dateIso;
   return d >= start && d <= end;
 };
 
@@ -274,24 +282,88 @@ const KEYS = {
   settings: "leeya:settings",
 };
 
+/* ---------- persistence: Supabase + offline retry queue + conflict detection ---------- */
+const lastKnownUpdatedAt = {}; // key -> ISO timestamp of the value we last read/wrote successfully
+const pendingWrites = {}; // key -> value still waiting to reach the server
+const conflictKeys = {}; // key -> true if another device changed this key since we last read it
+let retryTimer = null;
+
+function currentSyncStatus() {
+  const pendingCount = Object.keys(pendingWrites).length;
+  const conflictCount = Object.keys(conflictKeys).length;
+  let state = "saved";
+  if (pendingCount > 0) state = "offline";
+  else if (conflictCount > 0) state = "conflict";
+  return { state, pendingCount, conflictCount };
+}
+function notifySyncStatus() {
+  window.dispatchEvent(new CustomEvent("leeya:syncstatus", { detail: currentSyncStatus() }));
+}
+
 async function loadKey(key, fallback) {
   try {
-    const { data, error } = await supabase.from("leeya_kv").select("value").eq("key", key).maybeSingle();
+    const { data, error } = await supabase.from("leeya_kv").select("value, updated_at").eq("key", key).maybeSingle();
     if (error) throw error;
-    if (data && data.value !== null && data.value !== undefined) return data.value;
+    if (data && data.value !== null && data.value !== undefined) {
+      lastKnownUpdatedAt[key] = data.updated_at || null;
+      return data.value;
+    }
+    lastKnownUpdatedAt[key] = null;
     return fallback;
   } catch (e) {
     console.error("load failed", key, e);
     return fallback;
   }
 }
-async function saveKey(key, value) {
+
+async function attemptSave(key, value) {
   try {
-    const { error } = await supabase.from("leeya_kv").upsert({ key, value, updated_at: new Date().toISOString() });
+    // conflict check: has this row changed on the server since we last read it?
+    const { data: current, error: readErr } = await supabase.from("leeya_kv").select("updated_at").eq("key", key).maybeSingle();
+    if (!readErr && current && lastKnownUpdatedAt[key] && current.updated_at && current.updated_at !== lastKnownUpdatedAt[key]) {
+      conflictKeys[key] = true;
+    } else {
+      delete conflictKeys[key];
+    }
+    const nowIso = new Date().toISOString();
+    const { error } = await supabase.from("leeya_kv").upsert({ key, value, updated_at: nowIso });
     if (error) throw error;
+    lastKnownUpdatedAt[key] = nowIso;
+    return true;
   } catch (e) {
     console.error("save failed", key, e);
+    return false;
   }
+}
+
+function scheduleRetry() {
+  if (retryTimer) return;
+  retryTimer = setInterval(async () => {
+    const keys = Object.keys(pendingWrites);
+    if (keys.length === 0) { clearInterval(retryTimer); retryTimer = null; return; }
+    for (const key of keys) {
+      const ok = await attemptSave(key, pendingWrites[key]);
+      if (ok) delete pendingWrites[key];
+    }
+    notifySyncStatus();
+    if (Object.keys(pendingWrites).length === 0 && retryTimer) { clearInterval(retryTimer); retryTimer = null; }
+  }, 8000);
+}
+
+async function saveKey(key, value) {
+  const ok = await attemptSave(key, value);
+  if (ok) delete pendingWrites[key];
+  else { pendingWrites[key] = value; scheduleRetry(); }
+  notifySyncStatus();
+}
+
+function dismissConflict(key) {
+  delete conflictKeys[key];
+  notifySyncStatus();
+}
+function dismissAllConflicts() {
+  Object.keys(conflictKeys).forEach((k) => delete conflictKeys[k]);
+  notifySyncStatus();
 }
 
 /* ---------- small UI atoms ---------- */
@@ -397,6 +469,33 @@ function DiscountPicker({ discountType, setDiscountType, discountValue, setDisco
   );
 }
 
+/* ---------- Split payment editor (multiple methods on one sale) ---------- */
+function SplitPaymentEditor({ payments, setPayments, total }) {
+  const changeLine = (id, field, value) => setPayments((prev) => prev.map((p) => (p.id === id ? Object.assign({}, p, { [field]: value }) : p)));
+  const addLine = () => setPayments((prev) => prev.concat([{ id: uid(), method: "Cash", amount: "" }]));
+  const removeLine = (id) => setPayments((prev) => prev.filter((p) => p.id !== id));
+  const splitTotal = payments.reduce((s, p) => s + (Number(p.amount) || 0), 0);
+  const remaining = Math.round((total - splitTotal) * 100) / 100;
+
+  return (
+    <div style={{ border: "1px solid " + LINE, borderRadius: 8, padding: 10, marginBottom: 12 }}>
+      {payments.map((p) => (
+        <div key={p.id} style={{ display: "flex", gap: 6, marginBottom: 6, alignItems: "center" }}>
+          <select style={Object.assign({}, inputStyle, { width: 100 })} value={p.method} onChange={(e) => changeLine(p.id, "method", e.target.value)}>
+            <option>Cash</option><option>GCash</option><option>Card</option>
+          </select>
+          <input type="number" style={Object.assign({}, inputStyle, { flex: 1 })} placeholder="Amount" value={p.amount} onChange={(e) => changeLine(p.id, "amount", e.target.value)} />
+          <span onClick={() => removeLine(p.id)} style={{ cursor: "pointer", color: RUST, padding: "0 4px" }}>&times;</span>
+        </div>
+      ))}
+      <Btn onClick={addLine} style={{ fontSize: 12, padding: "6px 10px" }}>+ Add payment line</Btn>
+      <div style={{ display: "flex", justifyContent: "space-between", fontSize: 12, marginTop: 8, fontWeight: 700, color: remaining === 0 ? SAGE : RUST }}>
+        <span>{remaining === 0 ? "Fully covered" : remaining > 0 ? "Remaining: " + peso(remaining) : "Over by " + peso(Math.abs(remaining))}</span>
+      </div>
+    </div>
+  );
+}
+
 /* ================= APP ================= */
 export default function App() {
   const [loading, setLoading] = useState(true);
@@ -412,6 +511,18 @@ export default function App() {
   const [settings, setSettings] = useState({ lowStockThreshold: LOW_STOCK_THRESHOLD, categories: DEFAULT_CATEGORIES, catalogVersion: CATALOG_VERSION });
   const [currentUser, setCurrentUser] = useState(null);
   const [tab, setTab] = useState("pos");
+  const [syncStatus, setSyncStatus] = useState({ state: "saved", pendingCount: 0, conflictCount: 0 });
+
+  useEffect(() => {
+    const handler = (e) => setSyncStatus(e.detail);
+    window.addEventListener("leeya:syncstatus", handler);
+    const goOnline = () => scheduleRetry();
+    window.addEventListener("online", goOnline);
+    return () => {
+      window.removeEventListener("leeya:syncstatus", handler);
+      window.removeEventListener("online", goOnline);
+    };
+  }, []);
 
   const IDLE_LIMIT_MS = 15 * 60 * 1000;
   const lastActivityRef = useRef(Date.now());
@@ -560,6 +671,19 @@ export default function App() {
           ))}
         </div>
 
+        {syncStatus.state === "offline" && (
+          <div style={{ background: RUST + "15", border: "1px solid " + RUST + "55", borderRadius: 10, padding: "10px 14px", marginBottom: 16, fontSize: 13, color: RUST, display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
+            <strong>You're offline.</strong>
+            <span>{syncStatus.pendingCount} change{syncStatus.pendingCount === 1 ? "" : "s"} waiting to sync — keep this tab open until it reconnects.</span>
+          </div>
+        )}
+        {syncStatus.state === "conflict" && (
+          <div style={{ background: GOLD + "18", border: "1px solid " + GOLD + "55", borderRadius: 10, padding: "10px 14px", marginBottom: 16, fontSize: 13, color: "#7A5E14", display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap", justifyContent: "space-between" }}>
+            <span><strong>Heads up —</strong> data may have just changed on another device. Reload to make sure you're seeing the latest before making more changes.</span>
+            <Btn onClick={() => window.location.reload()}>Reload now</Btn>
+          </div>
+        )}
+
         {lowStockItems.length > 0 && (
           <div style={{ background: RUST + "15", border: "1px solid " + RUST + "55", borderRadius: 10, padding: "10px 14px", marginBottom: 16, fontSize: 13, color: RUST, display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
             <strong>Low stock:</strong>
@@ -577,6 +701,7 @@ export default function App() {
             customerPackages={customerPackages} setCustomerPackages={persist.customerPackages}
             cashDrawer={cashDrawer} setCashDrawer={persist.cashDrawer}
             expenses={expenses} setExpenses={persist.expenses}
+            settings={settings} setSettings={persist.settings}
             currentUser={currentUser}
             lowStockThreshold={lowStockThreshold}
           />
@@ -794,10 +919,14 @@ function CashDrawerCard({ cashDrawer, setCashDrawer, sales, expenses, setExpense
   const [expDesc, setExpDesc] = useState("");
   const [expAmount, setExpAmount] = useState("");
 
-  const todaySales = sales.filter((s) => !s.voided && s.date.slice(0, 10) === date);
-  const cashToday = todaySales.filter((s) => s.paymentMethod === "Cash").reduce((sum, s) => sum + s.total, 0);
-  const gcashToday = todaySales.filter((s) => s.paymentMethod === "GCash").reduce((sum, s) => sum + s.total, 0);
-  const cardToday = todaySales.filter((s) => s.paymentMethod === "Card").reduce((sum, s) => sum + s.total, 0);
+  const todaySales = sales.filter((s) => !s.voided && localDayOf(s.date) === date);
+  const methodTotal = (method) => todaySales.reduce((sum, s) => {
+    if (s.paymentSplits) return sum + s.paymentSplits.filter((p) => p.method === method).reduce((a, p) => a + p.amount, 0);
+    return sum + (s.paymentMethod === method ? s.total : 0);
+  }, 0);
+  const cashToday = methodTotal("Cash");
+  const gcashToday = methodTotal("GCash");
+  const cardToday = methodTotal("Card");
   const revenueToday = cashToday + gcashToday + cardToday;
 
   const expensesToday = expenses.filter((e) => e.date === date);
@@ -904,9 +1033,10 @@ function CashDrawerCard({ cashDrawer, setCashDrawer, sales, expenses, setExpense
 }
 
 /* ---------- Ticket edit modal: add/remove services, or add a custom charge ---------- */
-function TicketEditModal({ ticket, catalog, onSave, onClose }) {
-  const [items, setItems] = useState(ticket.items.map((i) => Object.assign({}, i)));
+function TicketEditModal({ ticket, catalog, staff, onSave, onClose }) {
+  const [items, setItems] = useState(ticket.items.map((i) => Object.assign({ staffId: ticket.staffId, staffName: ticket.staffName }, i)));
   const [addCatalogId, setAddCatalogId] = useState("");
+  const [addStaffId, setAddStaffId] = useState(ticket.staffId);
   const [customDesc, setCustomDesc] = useState("");
   const [customAmount, setCustomAmount] = useState("");
 
@@ -915,47 +1045,66 @@ function TicketEditModal({ ticket, catalog, onSave, onClose }) {
   const changeQty = (idx, delta) => {
     setItems((prev) => prev.map((it, i) => (i === idx ? Object.assign({}, it, { qty: it.qty + delta }) : it)).filter((it) => it.qty > 0));
   };
+  const changeStaff = (idx, newStaffId) => {
+    const staffMember = staff.find((s) => s.id === newStaffId);
+    setItems((prev) => prev.map((it, i) => (i === idx ? Object.assign({}, it, { staffId: newStaffId, staffName: staffMember ? staffMember.name : "" }) : it)));
+  };
   const removeAt = (idx) => setItems((prev) => prev.filter((_, i) => i !== idx));
 
   const addFromCatalog = () => {
     const def = catalog.find((c) => c.id === addCatalogId);
     if (!def) return;
+    const staffMember = staff.find((s) => s.id === addStaffId);
     setItems((prev) => {
-      const existing = prev.find((p) => p.catalogId === def.id && p.type === def.type);
+      const existing = prev.find((p) => p.catalogId === def.id && p.type === def.type && p.staffId === addStaffId);
       if (existing) return prev.map((p) => (p === existing ? Object.assign({}, p, { qty: p.qty + 1 }) : p));
-      return prev.concat([{ catalogId: def.id, name: def.name, price: def.price, qty: 1, type: def.type, kind: null, packageId: null }]);
+      return prev.concat([{ catalogId: def.id, name: def.name, price: def.price, qty: 1, type: def.type, kind: null, packageId: null, staffId: addStaffId, staffName: staffMember ? staffMember.name : "" }]);
     });
   };
 
   const addCustom = () => {
     if (!customDesc.trim() || customAmount === "") return;
-    setItems((prev) => prev.concat([{ catalogId: null, name: customDesc.trim(), price: Number(customAmount) || 0, qty: 1, type: "custom", kind: "custom", packageId: null }]));
+    const staffMember = staff.find((s) => s.id === addStaffId);
+    setItems((prev) => prev.concat([{ catalogId: null, name: customDesc.trim(), price: Number(customAmount) || 0, qty: 1, type: "custom", kind: "custom", packageId: null, staffId: addStaffId, staffName: staffMember ? staffMember.name : "" }]));
     setCustomDesc("");
     setCustomAmount("");
   };
 
   return (
     <Modal title="Edit ticket" onClose={onClose} wide>
-      <div style={{ maxHeight: 220, overflowY: "auto", marginBottom: 12 }}>
+      <div style={{ maxHeight: 260, overflowY: "auto", marginBottom: 12 }}>
         {items.map((i, idx) => {
           const meta = TYPE_META[i.type] || TYPE_META.service;
           return (
-            <div key={idx} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "8px 0", borderBottom: "1px solid " + LINE }}>
-              <div style={{ flex: 1 }}>
-                <div style={{ fontSize: 13, fontWeight: 600 }}>{i.name} <span style={{ fontSize: 11, color: meta.color }}>{meta.label}</span></div>
-                <div style={{ fontSize: 12, color: MUTED }}>{peso(i.price)} each</div>
+            <div key={idx} style={{ padding: "8px 0", borderBottom: "1px solid " + LINE }}>
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                <div style={{ flex: 1 }}>
+                  <div style={{ fontSize: 13, fontWeight: 600 }}>{i.name} <span style={{ fontSize: 11, color: meta.color }}>{meta.label}</span></div>
+                  <div style={{ fontSize: 12, color: MUTED }}>{peso(i.price)} each</div>
+                </div>
+                <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                  <span onClick={() => changeQty(idx, -1)} style={{ cursor: "pointer", width: 22, textAlign: "center", border: "1px solid " + LINE, borderRadius: 6 }}>-</span>
+                  <span style={{ minWidth: 16, textAlign: "center", fontSize: 13 }}>{i.qty}</span>
+                  <span onClick={() => changeQty(idx, 1)} style={{ cursor: "pointer", width: 22, textAlign: "center", border: "1px solid " + LINE, borderRadius: 6 }}>+</span>
+                  <span onClick={() => removeAt(idx)} style={{ cursor: "pointer", color: RUST, marginLeft: 6 }}>&times;</span>
+                </div>
               </div>
-              <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
-                <span onClick={() => changeQty(idx, -1)} style={{ cursor: "pointer", width: 22, textAlign: "center", border: "1px solid " + LINE, borderRadius: 6 }}>-</span>
-                <span style={{ minWidth: 16, textAlign: "center", fontSize: 13 }}>{i.qty}</span>
-                <span onClick={() => changeQty(idx, 1)} style={{ cursor: "pointer", width: 22, textAlign: "center", border: "1px solid " + LINE, borderRadius: 6 }}>+</span>
-                <span onClick={() => removeAt(idx)} style={{ cursor: "pointer", color: RUST, marginLeft: 6 }}>&times;</span>
-              </div>
+              {i.type === "service" && (
+                <select style={Object.assign({}, inputStyle, { marginTop: 4, padding: "5px 8px", fontSize: 12 })} value={i.staffId || ""} onChange={(e) => changeStaff(idx, e.target.value)}>
+                  {staff.filter((s) => s.active !== false).map((s) => (<option key={s.id} value={s.id}>{s.name}</option>))}
+                </select>
+              )}
             </div>
           );
         })}
         {items.length === 0 && <div style={{ fontSize: 13, color: MUTED }}>No items on this ticket.</div>}
       </div>
+
+      <Field label="Staff for new items">
+        <select style={inputStyle} value={addStaffId} onChange={(e) => setAddStaffId(e.target.value)}>
+          {staff.filter((s) => s.active !== false).map((s) => (<option key={s.id} value={s.id}>{s.name}</option>))}
+        </select>
+      </Field>
 
       <Field label="Add existing item from catalog">
         <div style={{ display: "flex", gap: 8 }}>
@@ -985,12 +1134,14 @@ function TicketEditModal({ ticket, catalog, onSave, onClose }) {
 
 /* ---------- POS Tab ---------- */
 function POSTab(props) {
-  const { catalog, setCatalog, customers, setCustomers, staff, sales, setSales, tickets, setTickets, customerPackages, setCustomerPackages, cashDrawer, setCashDrawer, expenses, setExpenses, currentUser, lowStockThreshold } = props;
+  const { catalog, setCatalog, customers, setCustomers, staff, sales, setSales, tickets, setTickets, customerPackages, setCustomerPackages, cashDrawer, setCashDrawer, expenses, setExpenses, settings, setSettings, currentUser, lowStockThreshold } = props;
   const [cart, setCart] = useState([]);
   const [category, setCategory] = useState("All");
   const [customerId, setCustomerId] = useState("");
   const [assignedStaffId, setAssignedStaffId] = useState(currentUser.id);
   const [payment, setPayment] = useState("Cash");
+  const [splitMode, setSplitMode] = useState(false);
+  const [splitPayments, setSplitPayments] = useState([{ id: uid(), method: "Cash", amount: "" }, { id: uid(), method: "GCash", amount: "" }]);
   const [discountType, setDiscountType] = useState("none");
   const [discountValue, setDiscountValue] = useState("");
   const [discountReason, setDiscountReason] = useState("");
@@ -998,6 +1149,8 @@ function POSTab(props) {
   const [receipt, setReceipt] = useState(null);
   const [ticketCheckout, setTicketCheckout] = useState(null);
   const [ticketPayment, setTicketPayment] = useState("Cash");
+  const [ticketSplitMode, setTicketSplitMode] = useState(false);
+  const [ticketSplitPayments, setTicketSplitPayments] = useState([{ id: uid(), method: "Cash", amount: "" }, { id: uid(), method: "GCash", amount: "" }]);
   const [ticketDiscountType, setTicketDiscountType] = useState("none");
   const [ticketDiscountValue, setTicketDiscountValue] = useState("");
   const [ticketDiscountReason, setTicketDiscountReason] = useState("");
@@ -1011,13 +1164,25 @@ function POSTab(props) {
   const filtered = search.trim() ? byCategory.filter((c) => c.name.toLowerCase().indexOf(search.trim().toLowerCase()) !== -1) : byCategory;
 
   const addToCart = (item) => {
+    const staffMember = staff.find((s) => s.id === assignedStaffId);
+    const staffName = staffMember ? staffMember.name : "";
+    const catalogId = item.catalogId !== undefined ? item.catalogId : item.id;
+    const mergeKey = catalogId + "|" + (item.kind || "") + "|" + (item.packageId || "");
     setCart((prev) => {
-      const existing = prev.find((p) => p.id === item.id);
-      if (existing) return prev.map((p) => (p.id === item.id ? Object.assign({}, p, { qty: p.qty + 1 }) : p));
-      return prev.concat([Object.assign({}, item, { catalogId: item.catalogId !== undefined ? item.catalogId : item.id, qty: 1 })]);
+      const existing = prev.find((p) => p.mergeKey === mergeKey && p.staffId === assignedStaffId);
+      if (existing) return prev.map((p) => (p === existing ? Object.assign({}, p, { qty: p.qty + 1 }) : p));
+      return prev.concat([{
+        lineId: uid(), mergeKey, catalogId, name: item.name, price: item.price, type: item.type,
+        kind: item.kind || null, packageId: item.packageId || null, qty: 1,
+        staffId: assignedStaffId, staffName: staffName,
+      }]);
     });
   };
-  const changeQty = (id, delta) => setCart((prev) => prev.map((p) => (p.id === id ? Object.assign({}, p, { qty: p.qty + delta }) : p)).filter((p) => p.qty > 0));
+  const changeQty = (lineId, delta) => setCart((prev) => prev.map((p) => (p.lineId === lineId ? Object.assign({}, p, { qty: p.qty + delta }) : p)).filter((p) => p.qty > 0));
+  const changeItemStaff = (lineId, newStaffId) => {
+    const staffMember = staff.find((s) => s.id === newStaffId);
+    setCart((prev) => prev.map((p) => (p.lineId === lineId ? Object.assign({}, p, { staffId: newStaffId, staffName: staffMember ? staffMember.name : "" }) : p)));
+  };
 
   const subtotal = cart.reduce((s, i) => s + i.price * i.qty, 0);
   const hasService = cart.some((i) => i.type === "service");
@@ -1028,9 +1193,13 @@ function POSTab(props) {
   const finalTotal = Math.max(0, subtotal - discountAmount);
   const tenderedNum = payment === "Cash" && amountTendered !== "" ? Number(amountTendered) : null;
   const changeDue = tenderedNum != null ? tenderedNum - finalTotal : null;
+  const splitTotal = splitPayments.reduce((s, p) => s + (Number(p.amount) || 0), 0);
+  const splitRemaining = Math.round((finalTotal - splitTotal) * 100) / 100;
+  const splitValid = splitMode ? Math.abs(splitRemaining) < 0.01 && splitPayments.some((p) => Number(p.amount) > 0) : true;
 
   const resetCartInputs = () => {
     setCart([]); setCustomerId(""); setPayment("Cash");
+    setSplitMode(false); setSplitPayments([{ id: uid(), method: "Cash", amount: "" }, { id: uid(), method: "GCash", amount: "" }]);
     setDiscountType("none"); setDiscountValue(""); setDiscountReason(""); setAmountTendered("");
   };
 
@@ -1070,16 +1239,19 @@ function POSTab(props) {
   };
 
   const finalizeSale = (args) => {
-    const items = args.items, subtotalV = args.subtotal, discountTypeV = args.discountType, discountValueV = args.discountValue, discountReasonV = args.discountReason, discountAmountV = args.discountAmount, total = args.total, paymentMethod = args.paymentMethod, amountTenderedV = args.amountTendered, changeDueV = args.changeDue, staffMember = args.staffMember, customer = args.customer, sourceTicketId = args.sourceTicketId;
+    const items = args.items, subtotalV = args.subtotal, discountTypeV = args.discountType, discountValueV = args.discountValue, discountReasonV = args.discountReason, discountAmountV = args.discountAmount, total = args.total, paymentMethod = args.paymentMethod, paymentSplitsV = args.paymentSplits || null, amountTenderedV = args.amountTendered, changeDueV = args.changeDue, staffMember = args.staffMember, customer = args.customer, sourceTicketId = args.sourceTicketId;
+    const orNumber = (settings.nextOrNumber != null ? settings.nextOrNumber : 1);
     const sale = {
-      id: uid(), date: new Date().toISOString(), items: items, subtotal: subtotalV,
+      id: uid(), orNumber: orNumber, date: new Date().toISOString(), items: items, subtotal: subtotalV,
       discountType: discountTypeV, discountValue: discountTypeV === "none" ? null : Number(discountValueV) || 0, discountReason: discountReasonV || "", discountAmount: discountAmountV,
-      total: total, paymentMethod: paymentMethod, amountTendered: amountTenderedV != null ? amountTenderedV : null, changeDue: changeDueV != null ? changeDueV : null,
+      total: total, paymentMethod: paymentMethod, paymentSplits: paymentSplitsV, amountTendered: amountTenderedV != null ? amountTenderedV : null, changeDue: changeDueV != null ? changeDueV : null,
       staffId: staffMember.id, staffName: staffMember.name,
+      processedById: currentUser.id, processedBy: currentUser.name,
       customerId: customer ? customer.id : null, customerName: customer ? customer.name : "Walk-in",
       voided: false, voidedAt: null,
     };
     setSales([sale].concat(sales));
+    setSettings(Object.assign({}, settings, { nextOrNumber: orNumber + 1 }));
     deductStock(items);
     applyPackageEffects(items, sale, customer);
     if (sourceTicketId) setTickets(tickets.filter((t) => t.id !== sourceTicketId));
@@ -1087,13 +1259,15 @@ function POSTab(props) {
   };
 
   const chargeNow = () => {
-    if (cart.length === 0 || blockedNoCustomer) return;
+    if (cart.length === 0 || blockedNoCustomer || (splitMode && !splitValid)) return;
     const staffMember = staff.find((s) => s.id === assignedStaffId) || currentUser;
     const customer = customers.find((c) => c.id === customerId);
     finalizeSale({
-      items: cart.map((i) => ({ catalogId: i.catalogId, name: i.name, price: i.price, qty: i.qty, type: i.type, kind: i.kind || null, packageId: i.packageId || null })),
+      items: cart.map((i) => ({ catalogId: i.catalogId, name: i.name, price: i.price, qty: i.qty, type: i.type, kind: i.kind || null, packageId: i.packageId || null, staffId: i.staffId, staffName: i.staffName })),
       subtotal: subtotal, discountType: discountType, discountValue: discountValue, discountReason: discountReason, discountAmount: discountAmount, total: finalTotal,
-      paymentMethod: payment, amountTendered: tenderedNum, changeDue: changeDue,
+      paymentMethod: splitMode ? "Split" : payment,
+      paymentSplits: splitMode ? splitPayments.filter((p) => Number(p.amount) > 0).map((p) => ({ method: p.method, amount: Number(p.amount) })) : null,
+      amountTendered: splitMode ? null : tenderedNum, changeDue: splitMode ? null : changeDue,
       staffMember: staffMember, customer: customer,
     });
     resetCartInputs();
@@ -1105,7 +1279,7 @@ function POSTab(props) {
     const customer = customers.find((c) => c.id === customerId);
     const ticket = {
       id: uid(), createdAt: new Date().toISOString(),
-      items: cart.map((i) => ({ catalogId: i.catalogId, name: i.name, price: i.price, qty: i.qty, type: i.type, kind: i.kind || null, packageId: i.packageId || null })),
+      items: cart.map((i) => ({ catalogId: i.catalogId, name: i.name, price: i.price, qty: i.qty, type: i.type, kind: i.kind || null, packageId: i.packageId || null, staffId: i.staffId, staffName: i.staffName })),
       total: subtotal, staffId: staffMember.id, staffName: staffMember.name,
       customerId: customer ? customer.id : null, customerName: customer ? customer.name : "Walk-in", status: "pending",
     };
@@ -1131,6 +1305,7 @@ function POSTab(props) {
 
   const openTicketCheckout = (t) => {
     setTicketCheckout(t); setTicketPayment("Cash");
+    setTicketSplitMode(false); setTicketSplitPayments([{ id: uid(), method: "Cash", amount: "" }, { id: uid(), method: "GCash", amount: "" }]);
     setTicketDiscountType("none"); setTicketDiscountValue(""); setTicketDiscountReason(""); setTicketTendered("");
   };
 
@@ -1139,13 +1314,20 @@ function POSTab(props) {
   const ticketFinalTotal = Math.max(0, ticketSubtotal - ticketDiscountAmount);
   const ticketTenderedNum = ticketPayment === "Cash" && ticketTendered !== "" ? Number(ticketTendered) : null;
   const ticketChangeDue = ticketTenderedNum != null ? ticketTenderedNum - ticketFinalTotal : null;
+  const ticketSplitTotal = ticketSplitPayments.reduce((s, p) => s + (Number(p.amount) || 0), 0);
+  const ticketSplitRemaining = Math.round((ticketFinalTotal - ticketSplitTotal) * 100) / 100;
+  const ticketSplitValid = ticketSplitMode ? Math.abs(ticketSplitRemaining) < 0.01 && ticketSplitPayments.some((p) => Number(p.amount) > 0) : true;
 
   const confirmTicketCheckout = () => {
+    if (ticketSplitMode && !ticketSplitValid) return;
     const staffMember = staff.find((s) => s.id === ticketCheckout.staffId) || { id: ticketCheckout.staffId, name: ticketCheckout.staffName };
     const customer = ticketCheckout.customerId ? { id: ticketCheckout.customerId, name: ticketCheckout.customerName } : null;
     finalizeSale({
       items: ticketCheckout.items, subtotal: ticketSubtotal, discountType: ticketDiscountType, discountValue: ticketDiscountValue, discountReason: ticketDiscountReason, discountAmount: ticketDiscountAmount,
-      total: ticketFinalTotal, paymentMethod: ticketPayment, amountTendered: ticketTenderedNum, changeDue: ticketChangeDue,
+      total: ticketFinalTotal,
+      paymentMethod: ticketSplitMode ? "Split" : ticketPayment,
+      paymentSplits: ticketSplitMode ? ticketSplitPayments.filter((p) => Number(p.amount) > 0).map((p) => ({ method: p.method, amount: Number(p.amount) })) : null,
+      amountTendered: ticketSplitMode ? null : ticketTenderedNum, changeDue: ticketSplitMode ? null : ticketChangeDue,
       staffMember: staffMember, customer: customer, sourceTicketId: ticketCheckout.id,
     });
     setTicketCheckout(null);
@@ -1195,8 +1377,8 @@ function POSTab(props) {
                   <div key={t.id} style={{ background: CARD, border: "1px solid " + LINE, borderRadius: 12, padding: 12, display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 10 }}>
                     <div>
                       <div style={{ fontWeight: 700, fontSize: 14 }}>{t.customerName} <Badge text={meta.label} color={meta.color} /></div>
-                      <div style={{ fontSize: 12, color: MUTED }}>{t.items.map((i) => i.qty + "× " + i.name).join(", ")}</div>
-                      <div style={{ fontSize: 12, color: MUTED }}>Staff: {t.staffName} · {peso(t.total)}</div>
+                      <div style={{ fontSize: 12, color: MUTED }}>{t.items.map((i) => i.qty + "× " + i.name + (i.staffName ? " (" + i.staffName + ")" : "")).join(", ")}</div>
+                      <div style={{ fontSize: 12, color: MUTED }}>{peso(t.total)}</div>
                     </div>
                     <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
                       <Btn onClick={() => setEditingTicket(t)}>Edit</Btn>
@@ -1216,16 +1398,23 @@ function POSTab(props) {
           {cart.length === 0 && <div style={{ color: MUTED, fontSize: 13 }}>Tap items to add them here.</div>}
           <div style={{ maxHeight: 220, overflowY: "auto" }}>
             {cart.map((i) => (
-              <div key={i.id} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "8px 0", borderBottom: "1px solid " + LINE }}>
-                <div style={{ flex: 1 }}>
-                  <div style={{ fontSize: 13, fontWeight: 600 }}>{i.name}</div>
-                  <div style={{ fontSize: 12, color: MUTED }}>{peso(i.price)} each</div>
+              <div key={i.lineId} style={{ padding: "8px 0", borderBottom: "1px solid " + LINE }}>
+                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                  <div style={{ flex: 1 }}>
+                    <div style={{ fontSize: 13, fontWeight: 600 }}>{i.name}</div>
+                    <div style={{ fontSize: 12, color: MUTED }}>{peso(i.price)} each</div>
+                  </div>
+                  <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                    <span onClick={() => changeQty(i.lineId, -1)} style={{ cursor: "pointer", width: 22, textAlign: "center", border: "1px solid " + LINE, borderRadius: 6 }}>-</span>
+                    <span style={{ minWidth: 16, textAlign: "center", fontSize: 13 }}>{i.qty}</span>
+                    <span onClick={() => changeQty(i.lineId, 1)} style={{ cursor: "pointer", width: 22, textAlign: "center", border: "1px solid " + LINE, borderRadius: 6 }}>+</span>
+                  </div>
                 </div>
-                <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
-                  <span onClick={() => changeQty(i.id, -1)} style={{ cursor: "pointer", width: 22, textAlign: "center", border: "1px solid " + LINE, borderRadius: 6 }}>-</span>
-                  <span style={{ minWidth: 16, textAlign: "center", fontSize: 13 }}>{i.qty}</span>
-                  <span onClick={() => changeQty(i.id, 1)} style={{ cursor: "pointer", width: 22, textAlign: "center", border: "1px solid " + LINE, borderRadius: 6 }}>+</span>
-                </div>
+                {i.type === "service" && (
+                  <select style={Object.assign({}, inputStyle, { marginTop: 4, padding: "5px 8px", fontSize: 12 })} value={i.staffId} onChange={(e) => changeItemStaff(i.lineId, e.target.value)}>
+                    {staff.filter((s) => s.active !== false).map((s) => (<option key={s.id} value={s.id}>{s.name}</option>))}
+                  </select>
+                )}
               </div>
             ))}
           </div>
@@ -1244,7 +1433,7 @@ function POSTab(props) {
             </div>
           )}
 
-          <Field label="Staff for this sale">
+          <Field label="Default staff for new items" hint="Applied to items as you add them. Change the staff on any line above individually if more than one person is doing the work.">
             <select style={inputStyle} value={assignedStaffId} onChange={(e) => setAssignedStaffId(e.target.value)}>
               {staff.filter((s) => s.active !== false).map((s) => (<option key={s.id} value={s.id}>{s.name}</option>))}
             </select>
@@ -1253,20 +1442,27 @@ function POSTab(props) {
           {!hasService && (
             <div>
               <Field label="Payment method">
-                <select style={inputStyle} value={payment} onChange={(e) => setPayment(e.target.value)}>
-                  <option>Cash</option><option>GCash</option><option>Card</option>
-                </select>
+                <label style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 12, color: MUTED, marginBottom: 6 }}>
+                  <input type="checkbox" checked={splitMode} onChange={(e) => setSplitMode(e.target.checked)} />
+                  Split across multiple payment methods
+                </label>
+                {!splitMode && (
+                  <select style={inputStyle} value={payment} onChange={(e) => setPayment(e.target.value)}>
+                    <option>Cash</option><option>GCash</option><option>Card</option>
+                  </select>
+                )}
               </Field>
+              {splitMode && <SplitPaymentEditor payments={splitPayments} setPayments={setSplitPayments} total={finalTotal} />}
               <DiscountPicker discountType={discountType} setDiscountType={setDiscountType} discountValue={discountValue} setDiscountValue={setDiscountValue} discountReason={discountReason} setDiscountReason={setDiscountReason} />
               {discountAmount > 0 && (
                 <div style={{ display: "flex", justifyContent: "space-between", fontSize: 13, color: SAGE, marginBottom: 6 }}><span>Discount</span><span>-{peso(discountAmount)}</span></div>
               )}
-              {payment === "Cash" && (
+              {!splitMode && payment === "Cash" && (
                 <Field label="Amount tendered (optional)">
                   <input type="number" style={inputStyle} value={amountTendered} onChange={(e) => setAmountTendered(e.target.value)} placeholder={peso(finalTotal)} />
                 </Field>
               )}
-              {changeDue != null && (
+              {!splitMode && changeDue != null && (
                 <div style={{ display: "flex", justifyContent: "space-between", fontSize: 13, fontWeight: 700, color: changeDue < 0 ? RUST : SAGE, marginBottom: 6 }}>
                   <span>{changeDue < 0 ? "Short by" : "Change due"}</span><span>{peso(Math.abs(changeDue))}</span>
                 </div>
@@ -1287,15 +1483,18 @@ function POSTab(props) {
               <div style={{ fontSize: 11, color: MUTED, marginTop: 6 }}>This sale includes a service — it'll wait as a ticket until the work is done, then you can check out with discount and payment options.</div>
             </div>
           ) : (
-            <Btn variant="primary" style={{ width: "100%" }} onClick={chargeNow} disabled={cart.length === 0 || blockedNoCustomer}>Charge now</Btn>
+            <Btn variant="primary" style={{ width: "100%" }} onClick={chargeNow} disabled={cart.length === 0 || blockedNoCustomer || (splitMode && !splitValid)}>Charge now</Btn>
           )}
         </div>
 
         {receipt && (
           <Modal title="Sale complete" onClose={() => setReceipt(null)}>
-            <div style={{ fontSize: 13, color: MUTED, marginBottom: 8 }}>{new Date(receipt.date).toLocaleString("en-PH")}</div>
+            <div style={{ fontSize: 13, color: MUTED, marginBottom: 8 }}>OR #{receipt.orNumber} · {new Date(receipt.date).toLocaleString("en-PH")}</div>
             {receipt.items.map((i, idx) => (
-              <div key={idx} style={{ display: "flex", justifyContent: "space-between", fontSize: 14, padding: "4px 0" }}><span>{i.qty} × {i.name}</span><span>{peso(i.price * i.qty)}</span></div>
+              <div key={idx} style={{ display: "flex", justifyContent: "space-between", fontSize: 14, padding: "4px 0" }}>
+                <span>{i.qty} × {i.name}{i.staffName ? <span style={{ color: MUTED, fontSize: 12 }}> — {i.staffName}</span> : null}</span>
+                <span>{peso(i.price * i.qty)}</span>
+              </div>
             ))}
             <div style={{ borderTop: "1px solid " + LINE, marginTop: 8, paddingTop: 8 }}>
               <div style={{ display: "flex", justifyContent: "space-between", fontSize: 13, color: MUTED }}><span>Subtotal</span><span>{peso(receipt.subtotal)}</span></div>
@@ -1309,44 +1508,61 @@ function POSTab(props) {
                   <div style={{ display: "flex", justifyContent: "space-between", fontSize: 13, color: MUTED }}><span>Change</span><span>{peso(receipt.changeDue)}</span></div>
                 </div>
               )}
+              {receipt.paymentSplits && (
+                <div style={{ marginTop: 4 }}>
+                  {receipt.paymentSplits.map((p, idx) => (
+                    <div key={idx} style={{ display: "flex", justifyContent: "space-between", fontSize: 13, color: MUTED }}><span>{p.method}</span><span>{peso(p.amount)}</span></div>
+                  ))}
+                </div>
+              )}
             </div>
-            <div style={{ fontSize: 12, color: MUTED, marginTop: 8 }}>Staff: {receipt.staffName} · Paid via {receipt.paymentMethod} · Customer: {receipt.customerName}</div>
+            <div style={{ fontSize: 12, color: MUTED, marginTop: 8 }}>Paid via {receipt.paymentMethod} · Customer: {receipt.customerName} · Encoded by {receipt.processedBy}</div>
             <Btn variant="primary" style={{ width: "100%", marginTop: 14 }} onClick={() => setReceipt(null)}>Done</Btn>
           </Modal>
         )}
 
         {ticketCheckout && (
           <Modal title="Checkout ticket" onClose={() => setTicketCheckout(null)}>
-            <div style={{ fontSize: 13, color: MUTED, marginBottom: 8 }}>{ticketCheckout.customerName} · {ticketCheckout.staffName}</div>
+            <div style={{ fontSize: 13, color: MUTED, marginBottom: 8 }}>{ticketCheckout.customerName}</div>
             {ticketCheckout.items.map((i, idx) => (
-              <div key={idx} style={{ display: "flex", justifyContent: "space-between", fontSize: 14, padding: "4px 0" }}><span>{i.qty} × {i.name}</span><span>{peso(i.price * i.qty)}</span></div>
+              <div key={idx} style={{ display: "flex", justifyContent: "space-between", fontSize: 14, padding: "4px 0" }}>
+                <span>{i.qty} × {i.name}{i.staffName ? <span style={{ color: MUTED, fontSize: 12 }}> — {i.staffName}</span> : null}</span>
+                <span>{peso(i.price * i.qty)}</span>
+              </div>
             ))}
             <div style={{ display: "flex", justifyContent: "space-between", fontSize: 13, color: MUTED, borderTop: "1px solid " + LINE, marginTop: 8, paddingTop: 8 }}><span>Subtotal</span><span>{peso(ticketSubtotal)}</span></div>
             <Field label="Payment method">
-              <select style={inputStyle} value={ticketPayment} onChange={(e) => setTicketPayment(e.target.value)}>
-                <option>Cash</option><option>GCash</option><option>Card</option>
-              </select>
+              <label style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 12, color: MUTED, marginBottom: 6 }}>
+                <input type="checkbox" checked={ticketSplitMode} onChange={(e) => setTicketSplitMode(e.target.checked)} />
+                Split across multiple payment methods
+              </label>
+              {!ticketSplitMode && (
+                <select style={inputStyle} value={ticketPayment} onChange={(e) => setTicketPayment(e.target.value)}>
+                  <option>Cash</option><option>GCash</option><option>Card</option>
+                </select>
+              )}
             </Field>
+            {ticketSplitMode && <SplitPaymentEditor payments={ticketSplitPayments} setPayments={setTicketSplitPayments} total={ticketFinalTotal} />}
             <DiscountPicker discountType={ticketDiscountType} setDiscountType={setTicketDiscountType} discountValue={ticketDiscountValue} setDiscountValue={setTicketDiscountValue} discountReason={ticketDiscountReason} setDiscountReason={setTicketDiscountReason} />
             {ticketDiscountAmount > 0 && (
               <div style={{ display: "flex", justifyContent: "space-between", fontSize: 13, color: SAGE, marginBottom: 6 }}><span>Discount</span><span>-{peso(ticketDiscountAmount)}</span></div>
             )}
-            {ticketPayment === "Cash" && (
+            {!ticketSplitMode && ticketPayment === "Cash" && (
               <Field label="Amount tendered (optional)">
                 <input type="number" style={inputStyle} value={ticketTendered} onChange={(e) => setTicketTendered(e.target.value)} placeholder={peso(ticketFinalTotal)} />
               </Field>
             )}
-            {ticketChangeDue != null && (
+            {!ticketSplitMode && ticketChangeDue != null && (
               <div style={{ display: "flex", justifyContent: "space-between", fontSize: 13, fontWeight: 700, color: ticketChangeDue < 0 ? RUST : SAGE, marginBottom: 6 }}>
                 <span>{ticketChangeDue < 0 ? "Short by" : "Change due"}</span><span>{peso(Math.abs(ticketChangeDue))}</span>
               </div>
             )}
             <div style={{ display: "flex", justifyContent: "space-between", fontWeight: 800, marginBottom: 12 }}><span>Total</span><span>{peso(ticketFinalTotal)}</span></div>
-            <Btn variant="primary" style={{ width: "100%" }} onClick={confirmTicketCheckout}>Complete payment</Btn>
+            <Btn variant="primary" style={{ width: "100%" }} onClick={confirmTicketCheckout} disabled={ticketSplitMode && !ticketSplitValid}>Complete payment</Btn>
           </Modal>
         )}
 
-        {editingTicket && <TicketEditModal ticket={editingTicket} catalog={catalog} onSave={saveTicketEdit} onClose={() => setEditingTicket(null)} />}
+        {editingTicket && <TicketEditModal ticket={editingTicket} catalog={catalog} staff={staff} onSave={saveTicketEdit} onClose={() => setEditingTicket(null)} />}
 
         {confirmCancelId && (
           <ConfirmModal title="Cancel this ticket?" body="The customer won't be charged and this ticket will be removed from the queue." confirmLabel="Cancel ticket" onConfirm={() => doCancelTicket(confirmCancelId)} onClose={() => setConfirmCancelId(null)} />
@@ -1771,11 +1987,20 @@ function InventoryTab({ catalog, setCatalog, isOwner, lowStockThreshold, categor
 }
 
 /* ---------- Daily Summary (screenshot-friendly) ---------- */
-function DailySummary({ range, onRangeChange, sales, catalog, staff, lowStockThreshold, onClose }) {
+function DailySummary({ range, onRangeChange, sales, catalog, staff, expenses, lowStockThreshold, onClose }) {
   const daySales = sales.filter((s) => inRange(s.date, range.start, range.end) && !s.voided);
   const revenue = daySales.reduce((sum, s) => sum + s.total, 0);
   const byPayment = {};
-  daySales.forEach((s) => { byPayment[s.paymentMethod] = (byPayment[s.paymentMethod] || 0) + s.total; });
+  daySales.forEach((s) => {
+    if (s.paymentSplits) {
+      s.paymentSplits.forEach((p) => { byPayment[p.method] = (byPayment[p.method] || 0) + p.amount; });
+    } else {
+      byPayment[s.paymentMethod] = (byPayment[s.paymentMethod] || 0) + s.total;
+    }
+  });
+  const expensesInRange = (expenses || []).filter((e) => inRange(e.date, range.start, range.end));
+  const expensesTotal = expensesInRange.reduce((sum, e) => sum + e.amount, 0);
+  const discountsTotal = daySales.reduce((sum, s) => sum + (s.discountAmount || 0), 0);
 
   const itemCounts = {};
   daySales.forEach((s) => s.items.forEach((i) => {
@@ -1786,7 +2011,13 @@ function DailySummary({ range, onRangeChange, sales, catalog, staff, lowStockThr
   const topItems = Object.entries(itemCounts).sort((a, b) => b[1].revenue - a[1].revenue).slice(0, 5);
 
   const byStaff = {};
-  daySales.forEach((s) => { byStaff[s.staffName] = (byStaff[s.staffName] || 0) + s.total; });
+  daySales.forEach((s) => {
+    const ratio = s.subtotal ? s.total / s.subtotal : 1;
+    s.items.forEach((i) => {
+      const name = i.staffName || s.staffName;
+      byStaff[name] = (byStaff[name] || 0) + i.price * i.qty * ratio;
+    });
+  });
 
   const lowStock = catalog.filter((c) => typeof c.stock === "number" && c.stock <= effectiveThreshold(c, lowStockThreshold));
 
@@ -1809,6 +2040,18 @@ function DailySummary({ range, onRangeChange, sales, catalog, staff, lowStockThr
             <div style={{ fontSize: 11, color: MUTED }}>Transactions</div>
             <div style={{ fontSize: 22, fontWeight: 800 }}>{daySales.length}</div>
           </div>
+          <div style={{ background: BG, borderRadius: 10, padding: 12, textAlign: "center" }}>
+            <div style={{ fontSize: 11, color: MUTED }}>Discounts given</div>
+            <div style={{ fontSize: 22, fontWeight: 800, color: GOLD }}>{peso(discountsTotal)}</div>
+          </div>
+          <div style={{ background: BG, borderRadius: 10, padding: 12, textAlign: "center" }}>
+            <div style={{ fontSize: 11, color: MUTED }}>Expenses</div>
+            <div style={{ fontSize: 22, fontWeight: 800, color: RUST }}>{peso(expensesTotal)}</div>
+          </div>
+          <div style={{ background: BG, borderRadius: 10, padding: 12, textAlign: "center", gridColumn: "1 / -1" }}>
+            <div style={{ fontSize: 11, color: MUTED }}>Net (revenue − expenses)</div>
+            <div style={{ fontSize: 22, fontWeight: 800, color: SAGE }}>{peso(revenue - expensesTotal)}</div>
+          </div>
         </div>
 
         <div style={{ fontWeight: 700, fontSize: 13, marginBottom: 6 }}>By payment method</div>
@@ -1822,6 +2065,10 @@ function DailySummary({ range, onRangeChange, sales, catalog, staff, lowStockThr
         <div style={{ fontWeight: 700, fontSize: 13, margin: "14px 0 6px" }}>By staff</div>
         {Object.keys(byStaff).length === 0 && <div style={{ fontSize: 13, color: MUTED }}>No sales recorded.</div>}
         {Object.entries(byStaff).map(([name, amt]) => (<div key={name} style={{ display: "flex", justifyContent: "space-between", fontSize: 13, padding: "3px 0" }}><span>{name}</span><span>{peso(amt)}</span></div>))}
+
+        <div style={{ fontWeight: 700, fontSize: 13, margin: "14px 0 6px" }}>Expenses</div>
+        {expensesInRange.length === 0 && <div style={{ fontSize: 13, color: MUTED }}>No expenses logged.</div>}
+        {expensesInRange.map((e) => (<div key={e.id} style={{ display: "flex", justifyContent: "space-between", fontSize: 13, padding: "3px 0" }}><span>{e.description}</span><span>{peso(e.amount)}</span></div>))}
 
         {lowStock.length > 0 && (
           <div style={{ marginTop: 14, background: RUST + "15", border: "1px solid " + RUST + "55", borderRadius: 8, padding: 10, fontSize: 12, color: RUST }}>
@@ -1956,8 +2203,9 @@ function SalesTab({ sales, setSales, catalog, setCatalog, customerPackages, setC
         {salesInRange.map((s) => (
           <div key={s.id} style={{ background: CARD, border: "1px solid " + LINE, borderRadius: 10, padding: "10px 14px", display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 8, opacity: s.voided ? 0.55 : 1 }}>
             <div>
-              <div style={{ fontWeight: 600, fontSize: 13 }}>{new Date(s.date).toLocaleString("en-PH")} · {s.customerName} {s.voided && <Badge text="voided" color={RUST} />}</div>
-              <div style={{ fontSize: 12, color: MUTED }}>{s.items.map((i) => i.qty + "x " + i.name).join(", ")} · {s.staffName} · {s.paymentMethod}</div>
+              <div style={{ fontWeight: 600, fontSize: 13 }}>OR #{s.orNumber} · {new Date(s.date).toLocaleString("en-PH")} · {s.customerName} {s.voided && <Badge text="voided" color={RUST} />}</div>
+              <div style={{ fontSize: 12, color: MUTED }}>{s.items.map((i) => i.qty + "x " + i.name + (i.staffName ? " (" + i.staffName + ")" : "")).join(", ")} · {s.paymentMethod}</div>
+              <div style={{ fontSize: 12, color: MUTED }}>Encoded by {s.processedBy || "—"}</div>
             </div>
             <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
               <div style={{ fontWeight: 700, fontSize: 13 }}>{peso(s.total)}</div>
@@ -1999,6 +2247,7 @@ function StaffTab({ staff, setStaff, sales, catalog, expenses, setExpenses, sett
   const [range, setRange] = useState(defaultRangeValue("last7"));
   const [summaryRange, setSummaryRange] = useState(null);
   const [thresholdInput, setThresholdInput] = useState(String(settings.lowStockThreshold != null ? settings.lowStockThreshold : LOW_STOCK_THRESHOLD));
+  const [orNumberInput, setOrNumberInput] = useState(String(settings.nextOrNumber != null ? settings.nextOrNumber : 1));
   const [showExpenses, setShowExpenses] = useState(false);
   const [confirmDeactivateId, setConfirmDeactivateId] = useState(null);
 
@@ -2025,10 +2274,20 @@ function StaffTab({ staff, setStaff, sales, catalog, expenses, setExpenses, sett
   const totalDiscounts = salesInRange.reduce((sum, s) => sum + (s.discountAmount || 0), 0);
 
   const commissionRows = staff.map((s) => {
-    const staffSales = salesInRange.filter((sa) => sa.staffId === s.id);
-    const gross = staffSales.reduce((sum, sa) => sum + sa.total, 0);
+    let gross = 0;
+    let count = 0;
+    salesInRange.forEach((sa) => {
+      const ratio = sa.subtotal ? sa.total / sa.subtotal : 1;
+      sa.items.forEach((i) => {
+        const itemStaffId = i.staffId || sa.staffId;
+        if (itemStaffId === s.id) {
+          gross += i.price * i.qty * ratio;
+          count += i.qty;
+        }
+      });
+    });
     const commission = gross * (Number(s.commissionRate) / 100);
-    return { staff: s, gross: gross, commission: commission, count: staffSales.length };
+    return { staff: s, gross: gross, commission: commission, count: count };
   });
 
   const itemAgg = {};
@@ -2040,19 +2299,29 @@ function StaffTab({ staff, setStaff, sales, catalog, expenses, setExpenses, sett
   const topItemsRange = Object.entries(itemAgg).sort((a, b) => b[1].revenue - a[1].revenue).slice(0, 5);
 
   const byDay = {};
-  salesInRange.forEach((s) => { const day = s.date.slice(0, 10); byDay[day] = (byDay[day] || 0) + s.total; });
+  salesInRange.forEach((s) => { const day = localDayOf(s.date); byDay[day] = (byDay[day] || 0) + s.total; });
   const dayRows = Object.entries(byDay).sort((a, b) => b[0].localeCompare(a[0]));
 
   const expensesInRange = expenses.filter((e) => inRange(e.date, range.start, range.end)).sort((a, b) => b.date.localeCompare(a.date));
   const expensesTotalRange = expensesInRange.reduce((sum, e) => sum + e.amount, 0);
 
   const exportCSV = () => {
-    const rows = [["Date", "Time", "Customer", "Staff", "Items", "Subtotal", "Discount", "Discount Reason", "Payment", "Total", "Commission Rate %", "Commission", "Voided"]];
+    const rows = [["OR #", "Date", "Time", "Customer", "Items (staff)", "Subtotal", "Discount", "Discount Reason", "Payment", "Total", "Commission by staff", "Encoded by", "Voided"]];
     sales.filter((s) => inRange(s.date, range.start, range.end)).forEach((s) => {
-      const staffMember = staff.find((st) => st.id === s.staffId);
-      const rate = staffMember ? Number(staffMember.commissionRate) || 0 : 0;
-      const commission = s.total * (rate / 100);
-      rows.push([s.date.slice(0, 10), new Date(s.date).toLocaleTimeString("en-PH"), s.customerName, s.staffName, s.items.map((i) => i.qty + "x " + i.name).join("; "), (s.subtotal != null ? s.subtotal : s.total).toFixed(2), (s.discountAmount || 0).toFixed(2), s.discountReason || "", s.paymentMethod, s.total.toFixed(2), rate, commission.toFixed(2), s.voided ? "Yes" : "No"]);
+      const ratio = s.subtotal ? s.total / s.subtotal : 1;
+      const byStaffGross = {};
+      s.items.forEach((i) => {
+        const staffId = i.staffId || s.staffId;
+        const staffMember = staff.find((st) => st.id === staffId);
+        const name = i.staffName || s.staffName || "Unassigned";
+        const rate = staffMember ? Number(staffMember.commissionRate) || 0 : 0;
+        byStaffGross[name] = byStaffGross[name] || { gross: 0, rate: rate };
+        byStaffGross[name].gross += i.price * i.qty * ratio;
+      });
+      const commissionSummary = Object.entries(byStaffGross).map(([name, v]) => name + ": " + peso(v.gross * (v.rate / 100))).join(", ");
+      const itemsSummary = s.items.map((i) => i.qty + "x " + i.name + (i.staffName ? " (" + i.staffName + ")" : "")).join("; ");
+      const paymentDisplay = s.paymentSplits ? s.paymentSplits.map((p) => p.method + " " + peso(p.amount)).join(" + ") : s.paymentMethod;
+      rows.push([s.orNumber || "", localDayOf(s.date), new Date(s.date).toLocaleTimeString("en-PH"), s.customerName, itemsSummary, (s.subtotal != null ? s.subtotal : s.total).toFixed(2), (s.discountAmount || 0).toFixed(2), s.discountReason || "", paymentDisplay, s.total.toFixed(2), commissionSummary, s.processedBy || "", s.voided ? "Yes" : "No"]);
     });
     downloadCSV("leeya-sales-" + range.start + "-to-" + range.end + ".csv", rows);
   };
@@ -2105,7 +2374,7 @@ function StaffTab({ staff, setStaff, sales, catalog, expenses, setExpenses, sett
         <div style={{ display: "flex", flexDirection: "column", gap: 6, marginBottom: 24 }}>
           {commissionRows.map((r) => (
             <div key={r.staff.id} style={{ background: CARD, border: "1px solid " + LINE, borderRadius: 10, padding: "10px 14px", display: "flex", justifyContent: "space-between", flexWrap: "wrap", gap: 8 }}>
-              <div style={{ fontWeight: 600 }}>{r.staff.name} <span style={{ fontSize: 12, color: MUTED }}>({r.staff.commissionRate}% rate · {r.count} sales)</span></div>
+              <div style={{ fontWeight: 600 }}>{r.staff.name} <span style={{ fontSize: 12, color: MUTED }}>({r.staff.commissionRate}% rate · {r.count} item{r.count === 1 ? "" : "s"})</span></div>
               <div style={{ display: "flex", gap: 16 }}>
                 <div style={{ fontSize: 13, color: MUTED }}>Gross: {peso(r.gross)}</div>
                 <div style={{ fontSize: 13, fontWeight: 700, color: SAGE }}>Commission: {peso(r.commission)}</div>
@@ -2187,6 +2456,17 @@ function StaffTab({ staff, setStaff, sales, catalog, expenses, setExpenses, sett
             </div>
           </div>
 
+          <div style={{ background: CARD, border: "1px solid " + LINE, borderRadius: 10, padding: "12px 14px", marginBottom: 20, display: "flex", alignItems: "center", justifyContent: "space-between", flexWrap: "wrap", gap: 10 }}>
+            <div>
+              <div style={{ fontWeight: 700, fontSize: 13 }}>Next official receipt (OR) number</div>
+              <div style={{ fontSize: 12, color: MUTED }}>Every sale gets the next number in sequence, then this increases automatically. Change it to match your paper OR booklet if needed.</div>
+            </div>
+            <div style={{ display: "flex", gap: 8 }}>
+              <input type="number" min="1" style={Object.assign({}, inputStyle, { width: 100 })} value={orNumberInput} onChange={(e) => setOrNumberInput(e.target.value)} />
+              <Btn variant="primary" onClick={() => setSettings(Object.assign({}, settings, { nextOrNumber: Math.max(1, Number(orNumberInput) || 1) }))}>Save</Btn>
+            </div>
+          </div>
+
           <BackupRestore allData={allData} onRestoreAll={onRestoreAll} />
 
           <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 10 }}>
@@ -2257,7 +2537,7 @@ function StaffTab({ staff, setStaff, sales, catalog, expenses, setExpenses, sett
       )}
 
       {summaryRange && (
-        <DailySummary range={summaryRange} onRangeChange={setSummaryRange} sales={sales} catalog={catalog} staff={staff} lowStockThreshold={settings.lowStockThreshold != null ? settings.lowStockThreshold : LOW_STOCK_THRESHOLD} onClose={() => setSummaryRange(null)} />
+        <DailySummary range={summaryRange} onRangeChange={setSummaryRange} sales={sales} catalog={catalog} staff={staff} expenses={expenses} lowStockThreshold={settings.lowStockThreshold != null ? settings.lowStockThreshold : LOW_STOCK_THRESHOLD} onClose={() => setSummaryRange(null)} />
       )}
       {confirmDeactivateId && (
         <ConfirmModal
