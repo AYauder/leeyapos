@@ -280,6 +280,8 @@ const KEYS = {
   cashDrawer: "leeya:cashdrawer",
   expenses: "leeya:expenses",
   settings: "leeya:settings",
+  messages: "leeya:messages",
+  presence: "leeya:presence",
 };
 
 /* ---------- persistence: Supabase + offline retry queue + conflict detection ---------- */
@@ -730,6 +732,7 @@ export default function App() {
           />
         )}
       </div>
+      <MessengerWidget currentUser={currentUser} staff={staff} />
     </div>
   );
 }
@@ -2548,6 +2551,220 @@ function StaffTab({ staff, setStaff, sales, catalog, expenses, setExpenses, sett
           onClose={() => setConfirmDeactivateId(null)}
         />
       )}
+    </div>
+  );
+}
+
+/* ---------- Messenger: owner <-> staff chat widget ---------- */
+const ONLINE_WINDOW_MS = 3 * 60 * 1000;
+
+function loadLastSeen(userId) {
+  try {
+    const raw = localStorage.getItem("leeya-chat-lastseen-" + userId);
+    return raw ? JSON.parse(raw) : {};
+  } catch (e) {
+    return {};
+  }
+}
+function saveLastSeen(userId, map) {
+  try {
+    localStorage.setItem("leeya-chat-lastseen-" + userId, JSON.stringify(map));
+  } catch (e) {
+    // ignore — badge counts just won't persist across reloads
+  }
+}
+
+function MessengerWidget({ currentUser, staff }) {
+  const isOwner = currentUser.role === "owner";
+  const [messages, setMessages] = useState([]);
+  const [presence, setPresence] = useState({});
+  const [open, setOpen] = useState(false);
+  const [activeStaffId, setActiveStaffId] = useState(isOwner ? null : currentUser.id);
+  const [draft, setDraft] = useState("");
+  const [toast, setToast] = useState(null);
+  const [lastSeenMap, setLastSeenMap] = useState(() => loadLastSeen(currentUser.id));
+  const seenIdsRef = useRef(new Set());
+  const initializedRef = useRef(false);
+  const openRef = useRef(open);
+  const activeStaffIdRef = useRef(activeStaffId);
+  useEffect(() => { openRef.current = open; }, [open]);
+  useEffect(() => { activeStaffIdRef.current = activeStaffId; }, [activeStaffId]);
+
+  useEffect(() => {
+    let cancelled = false;
+    const beat = async () => {
+      const latest = await loadKey(KEYS.presence, {});
+      if (cancelled) return;
+      const updated = Object.assign({}, latest, { [currentUser.id]: new Date().toISOString() });
+      setPresence(updated);
+      saveKey(KEYS.presence, updated);
+    };
+    beat();
+    const id = setInterval(beat, 30000);
+    return () => { cancelled = true; clearInterval(id); };
+  }, [currentUser.id]);
+
+  useEffect(() => {
+    let cancelled = false;
+    const poll = async () => {
+      const latest = await loadKey(KEYS.messages, []);
+      if (cancelled) return;
+      if (initializedRef.current) {
+        const relevant = latest.filter((m) => (isOwner ? true : m.staffId === currentUser.id));
+        const newOnes = relevant.filter((m) => !seenIdsRef.current.has(m.id));
+        newOnes.forEach((m) => seenIdsRef.current.add(m.id));
+        const incoming = newOnes.filter((m) => (isOwner ? m.senderRole === "staff" : m.senderRole === "owner"));
+        if (incoming.length > 0) {
+          const last = incoming[incoming.length - 1];
+          const viewingThatThread = openRef.current && (isOwner ? activeStaffIdRef.current === last.staffId : true);
+          if (!viewingThatThread) {
+            setToast({ text: last.text, fromName: last.senderName, staffId: last.staffId });
+          }
+        }
+      } else {
+        latest.forEach((m) => seenIdsRef.current.add(m.id));
+        initializedRef.current = true;
+      }
+      setMessages(latest);
+    };
+    poll();
+    const id = setInterval(poll, 8000);
+    return () => { cancelled = true; clearInterval(id); };
+  }, [currentUser.id, isOwner]);
+
+  const threadStaffId = isOwner ? activeStaffId : currentUser.id;
+  const threadMessages = threadStaffId ? messages.filter((m) => m.staffId === threadStaffId).sort((a, b) => new Date(a.createdAt) - new Date(b.createdAt)) : [];
+
+  const unreadForThread = (staffId, forOwner) => {
+    const seen = lastSeenMap[staffId] || null;
+    return messages.filter((m) => m.staffId === staffId && (forOwner ? m.senderRole === "staff" : m.senderRole === "owner") && (!seen || m.createdAt > seen)).length;
+  };
+  const totalUnread = isOwner
+    ? staff.filter((s) => s.role !== "owner").reduce((sum, s) => sum + unreadForThread(s.id, true), 0)
+    : unreadForThread(currentUser.id, false);
+
+  const markThreadSeen = (staffId) => {
+    const nowIso = new Date().toISOString();
+    const updated = Object.assign({}, lastSeenMap, { [staffId]: nowIso });
+    setLastSeenMap(updated);
+    saveLastSeen(currentUser.id, updated);
+  };
+
+  const openThread = (staffId) => {
+    setActiveStaffId(staffId);
+    setOpen(true);
+    setToast(null);
+    markThreadSeen(staffId);
+  };
+
+  const sendMessage = async () => {
+    if (!draft.trim() || !threadStaffId) return;
+    const msg = { id: uid(), staffId: threadStaffId, senderRole: isOwner ? "owner" : "staff", senderName: currentUser.name, text: draft.trim(), createdAt: new Date().toISOString() };
+    const latest = await loadKey(KEYS.messages, []);
+    const updated = latest.concat([msg]);
+    setMessages(updated);
+    saveKey(KEYS.messages, updated);
+    markThreadSeen(threadStaffId);
+    setDraft("");
+    setOpen(false);
+  };
+
+  const chattableStaff = staff.filter((s) => s.role !== "owner" && s.active !== false).sort((a, b) => {
+    const aOnline = presence[a.id] && Date.now() - new Date(presence[a.id]).getTime() < ONLINE_WINDOW_MS;
+    const bOnline = presence[b.id] && Date.now() - new Date(presence[b.id]).getTime() < ONLINE_WINDOW_MS;
+    if (aOnline !== bOnline) return aOnline ? -1 : 1;
+    return a.name.localeCompare(b.name);
+  });
+  const activeStaffMember = staff.find((s) => s.id === threadStaffId);
+
+  return (
+    <div style={{ position: "fixed", right: 20, bottom: 20, zIndex: 60 }}>
+      {toast && (
+        <div
+          onClick={() => openThread(toast.staffId)}
+          style={{ position: "absolute", bottom: 66, right: 0, width: 260, background: CARD, border: "1px solid " + LINE, borderRadius: 12, padding: 12, boxShadow: "0 4px 16px rgba(0,0,0,0.18)", cursor: "pointer" }}
+        >
+          <div style={{ fontWeight: 700, fontSize: 13 }}>New message from {toast.fromName}</div>
+          <div style={{ fontSize: 12, color: MUTED, marginTop: 2, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{toast.text}</div>
+        </div>
+      )}
+
+      {open && (
+        <div style={{ position: "absolute", bottom: 66, right: 0, width: 300, height: 400, background: CARD, border: "1px solid " + LINE, borderRadius: 14, boxShadow: "0 8px 24px rgba(0,0,0,0.2)", display: "flex", flexDirection: "column", overflow: "hidden" }}>
+          <div style={{ background: INK, color: "#fff", padding: "10px 14px", display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+            <div style={{ fontWeight: 700, fontSize: 13 }}>
+              {isOwner && !activeStaffId ? "Messages" : (activeStaffMember ? activeStaffMember.name : "Messages")}
+            </div>
+            <div style={{ display: "flex", gap: 10, alignItems: "center" }}>
+              {isOwner && activeStaffId && (
+                <span onClick={() => setActiveStaffId(null)} style={{ cursor: "pointer", fontSize: 12 }}>Back</span>
+              )}
+              <span onClick={() => setOpen(false)} style={{ cursor: "pointer", fontSize: 16, lineHeight: 1 }}>&minus;</span>
+            </div>
+          </div>
+
+          {isOwner && !activeStaffId ? (
+            <div style={{ flex: 1, overflowY: "auto" }}>
+              {chattableStaff.length === 0 && <div style={{ padding: 14, fontSize: 13, color: MUTED }}>No staff accounts yet.</div>}
+              {chattableStaff.map((s) => {
+                const online = presence[s.id] && Date.now() - new Date(presence[s.id]).getTime() < ONLINE_WINDOW_MS;
+                const unread = unreadForThread(s.id, true);
+                const staffMsgs = messages.filter((m) => m.staffId === s.id);
+                const last = staffMsgs.length ? staffMsgs[staffMsgs.length - 1] : null;
+                return (
+                  <div key={s.id} onClick={() => openThread(s.id)} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "10px 14px", borderBottom: "1px solid " + LINE, cursor: "pointer" }}>
+                    <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                      <span style={{ width: 8, height: 8, borderRadius: 999, background: online ? SAGE : LINE_STRONG, display: "inline-block" }} />
+                      <div>
+                        <div style={{ fontSize: 13, fontWeight: 600 }}>{s.name}</div>
+                        {last && <div style={{ fontSize: 11, color: MUTED, maxWidth: 160, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{last.text}</div>}
+                      </div>
+                    </div>
+                    {unread > 0 && <span style={{ background: RUST, color: "#fff", fontSize: 11, fontWeight: 700, borderRadius: 999, padding: "2px 7px" }}>{unread}</span>}
+                  </div>
+                );
+              })}
+            </div>
+          ) : (
+            <div style={{ flex: 1, display: "flex", flexDirection: "column" }}>
+              <div style={{ flex: 1, overflowY: "auto", padding: 10 }}>
+                {threadMessages.length === 0 && <div style={{ fontSize: 12, color: MUTED, textAlign: "center", marginTop: 20 }}>No messages yet — say hi.</div>}
+                {threadMessages.map((m) => {
+                  const mine = m.senderRole === (isOwner ? "owner" : "staff");
+                  return (
+                    <div key={m.id} style={{ display: "flex", justifyContent: mine ? "flex-end" : "flex-start", marginBottom: 6 }}>
+                      <div style={{ maxWidth: "75%", background: mine ? INK : BG, color: mine ? "#fff" : INK, borderRadius: 12, padding: "7px 11px", fontSize: 13 }}>
+                        {m.text}
+                        <div style={{ fontSize: 10, opacity: 0.7, marginTop: 2 }}>{new Date(m.createdAt).toLocaleTimeString("en-PH", { hour: "numeric", minute: "2-digit" })}</div>
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+              <div style={{ display: "flex", gap: 6, padding: 10, borderTop: "1px solid " + LINE }}>
+                <input
+                  style={Object.assign({}, inputStyle, { flex: 1 })}
+                  placeholder="Type a message..."
+                  value={draft}
+                  onChange={(e) => setDraft(e.target.value)}
+                  onKeyDown={(e) => e.key === "Enter" && sendMessage()}
+                />
+                <Btn variant="primary" onClick={sendMessage} style={{ padding: "9px 14px" }}>Send</Btn>
+              </div>
+            </div>
+          )}
+        </div>
+      )}
+
+      <div
+        onClick={() => { setToast(null); if (open) { setOpen(false); } else { setOpen(true); if (threadStaffId) markThreadSeen(threadStaffId); } }}
+        style={{ width: 52, height: 52, borderRadius: 999, background: INK, color: GOLD, display: "flex", alignItems: "center", justifyContent: "center", cursor: "pointer", boxShadow: "0 4px 12px rgba(0,0,0,0.25)", fontSize: 22, position: "relative" }}
+      >
+        💬
+        {totalUnread > 0 && (
+          <span style={{ position: "absolute", top: -4, right: -4, background: RUST, color: "#fff", fontSize: 11, fontWeight: 700, borderRadius: 999, padding: "2px 6px", minWidth: 18, textAlign: "center" }}>{totalUnread}</span>
+        )}
+      </div>
     </div>
   );
 }
