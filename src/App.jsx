@@ -2638,6 +2638,10 @@ function MessengerWidget({ currentUser, staff }) {
 
   const threadStaffId = isOwner ? activeStaffId : currentUser.id;
   const threadMessages = threadStaffId ? messages.filter((m) => m.staffId === threadStaffId).sort((a, b) => new Date(a.createdAt) - new Date(b.createdAt)) : [];
+  const threadScrollRef = useRef(null);
+  useEffect(() => {
+    if (threadScrollRef.current) threadScrollRef.current.scrollTop = threadScrollRef.current.scrollHeight;
+  }, [threadMessages.length, open, activeStaffId]);
 
   const unreadForThread = (staffId, forOwner) => {
     const seen = lastSeenMap[staffId] || null;
@@ -2696,7 +2700,7 @@ function MessengerWidget({ currentUser, staff }) {
       )}
 
       {open && (
-        <div style={{ position: "absolute", bottom: 66, right: 0, width: 300, height: 400, background: CARD, border: "1px solid " + LINE, borderRadius: 14, boxShadow: "0 8px 24px rgba(0,0,0,0.2)", display: "flex", flexDirection: "column", overflow: "hidden" }}>
+        <div style={{ position: "absolute", bottom: 66, right: 0, width: 300, height: 400, maxHeight: "70vh", background: CARD, border: "1px solid " + LINE, borderRadius: 14, boxShadow: "0 8px 24px rgba(0,0,0,0.2)", display: "flex", flexDirection: "column", overflow: "hidden" }}>
           <div style={{ background: INK, color: "#fff", padding: "10px 14px", display: "flex", justifyContent: "space-between", alignItems: "center" }}>
             <div style={{ fontWeight: 700, fontSize: 13 }}>
               {isOwner && !activeStaffId ? "Messages" : (activeStaffMember ? activeStaffMember.name : "Messages")}
@@ -2710,7 +2714,7 @@ function MessengerWidget({ currentUser, staff }) {
           </div>
 
           {isOwner && !activeStaffId ? (
-            <div style={{ flex: 1, overflowY: "auto" }}>
+            <div style={{ flex: 1, minHeight: 0, overflowY: "auto" }}>
               {chattableStaff.length === 0 && <div style={{ padding: 14, fontSize: 13, color: MUTED }}>No staff accounts yet.</div>}
               {chattableStaff.map((s) => {
                 const online = presence[s.id] && Date.now() - new Date(presence[s.id]).getTime() < ONLINE_WINDOW_MS;
@@ -2732,8 +2736,8 @@ function MessengerWidget({ currentUser, staff }) {
               })}
             </div>
           ) : (
-            <div style={{ flex: 1, display: "flex", flexDirection: "column" }}>
-              <div style={{ flex: 1, overflowY: "auto", padding: 10 }}>
+            <div style={{ flex: 1, minHeight: 0, display: "flex", flexDirection: "column" }}>
+              <div ref={threadScrollRef} style={{ flex: 1, minHeight: 0, overflowY: "auto", padding: 10 }}>
                 {threadMessages.length === 0 && <div style={{ fontSize: 12, color: MUTED, textAlign: "center", marginTop: 20 }}>No messages yet — say hi.</div>}
                 {threadMessages.map((m) => {
                   const mine = m.senderRole === (isOwner ? "owner" : "staff");
@@ -2747,7 +2751,7 @@ function MessengerWidget({ currentUser, staff }) {
                   );
                 })}
               </div>
-              <div style={{ display: "flex", gap: 6, padding: 10, borderTop: "1px solid " + LINE }}>
+              <div style={{ display: "flex", gap: 6, padding: 10, borderTop: "1px solid " + LINE, flexShrink: 0 }}>
                 <input
                   style={Object.assign({}, inputStyle, { flex: 1 })}
                   placeholder="Type a message..."
