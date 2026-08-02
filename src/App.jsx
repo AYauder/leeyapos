@@ -320,7 +320,6 @@ async function loadKey(key, fallback) {
 
 async function attemptSave(key, value) {
   try {
-    // conflict check: has this row changed on the server since we last read it?
     const { data: current, error: readErr } = await supabase.from("leeya_kv").select("updated_at").eq("key", key).maybeSingle();
     if (!readErr && current && lastKnownUpdatedAt[key] && current.updated_at && current.updated_at !== lastKnownUpdatedAt[key]) {
       conflictKeys[key] = true;
@@ -518,7 +517,7 @@ export default function App() {
   useEffect(() => {
     const handler = (e) => setSyncStatus(e.detail);
     window.addEventListener("leeya:syncstatus", handler);
-    const goOnline = () => scheduleRetry();
+    const goOnline = () => { if (typeof scheduleRetry === "function") scheduleRetry(); };
     window.addEventListener("online", goOnline);
     return () => {
       window.removeEventListener("leeya:syncstatus", handler);
@@ -2582,6 +2581,7 @@ function MessengerWidget({ currentUser, staff }) {
   const [activeStaffId, setActiveStaffId] = useState(isOwner ? null : currentUser.id);
   const [draft, setDraft] = useState("");
   const [toast, setToast] = useState(null);
+  const [centerPopup, setCenterPopup] = useState(false);
   const [lastSeenMap, setLastSeenMap] = useState(() => loadLastSeen(currentUser.id));
   const seenIdsRef = useRef(new Set());
   const initializedRef = useRef(false);
@@ -2616,9 +2616,13 @@ function MessengerWidget({ currentUser, staff }) {
         const incoming = newOnes.filter((m) => (isOwner ? m.senderRole === "staff" : m.senderRole === "owner"));
         if (incoming.length > 0) {
           const last = incoming[incoming.length - 1];
-          const viewingThatThread = openRef.current && (isOwner ? activeStaffIdRef.current === last.staffId : true);
-          if (!viewingThatThread) {
-            setToast({ text: last.text, fromName: last.senderName, staffId: last.staffId });
+          if (isOwner) {
+            const viewingThatThread = openRef.current && activeStaffIdRef.current === last.staffId;
+            if (!viewingThatThread) {
+              setToast({ text: last.text, fromName: last.senderName, staffId: last.staffId });
+            }
+          } else {
+            setCenterPopup(true);
           }
         }
       } else {
@@ -2667,6 +2671,7 @@ function MessengerWidget({ currentUser, staff }) {
     markThreadSeen(threadStaffId);
     setDraft("");
     setOpen(false);
+    setCenterPopup(false);
   };
 
   const chattableStaff = staff.filter((s) => s.role !== "owner" && s.active !== false).sort((a, b) => {
@@ -2678,7 +2683,8 @@ function MessengerWidget({ currentUser, staff }) {
   const activeStaffMember = staff.find((s) => s.id === threadStaffId);
 
   return (
-    <div style={{ position: "fixed", right: 20, bottom: 20, zIndex: 60 }}>
+    <React.Fragment>
+      <div style={{ position: "fixed", right: 20, bottom: 20, zIndex: 60 }}>
       {toast && (
         <div
           onClick={() => openThread(toast.staffId)}
@@ -2765,6 +2771,36 @@ function MessengerWidget({ currentUser, staff }) {
           <span style={{ position: "absolute", top: -4, right: -4, background: RUST, color: "#fff", fontSize: 11, fontWeight: 700, borderRadius: 999, padding: "2px 6px", minWidth: 18, textAlign: "center" }}>{totalUnread}</span>
         )}
       </div>
-    </div>
+      </div>
+
+      {!isOwner && centerPopup && (
+        <Modal
+          title={"Message from " + (threadMessages.length ? threadMessages[threadMessages.length - 1].senderName : "Owner")}
+          onClose={() => { setCenterPopup(false); markThreadSeen(threadStaffId); }}
+        >
+          <div style={{ maxHeight: 240, overflowY: "auto", marginBottom: 12 }}>
+            {threadMessages.slice(-4).map((m) => (
+              <div key={m.id} style={{ display: "flex", justifyContent: m.senderRole === "staff" ? "flex-end" : "flex-start", marginBottom: 6 }}>
+                <div style={{ maxWidth: "80%", background: m.senderRole === "staff" ? INK : BG, color: m.senderRole === "staff" ? "#fff" : INK, borderRadius: 12, padding: "7px 11px", fontSize: 13 }}>
+                  {m.text}
+                  <div style={{ fontSize: 10, opacity: 0.7, marginTop: 2 }}>{new Date(m.createdAt).toLocaleTimeString("en-PH", { hour: "numeric", minute: "2-digit" })}</div>
+                </div>
+              </div>
+            ))}
+          </div>
+          <div style={{ display: "flex", gap: 6 }}>
+            <input
+              autoFocus
+              style={Object.assign({}, inputStyle, { flex: 1 })}
+              placeholder="Type a reply..."
+              value={draft}
+              onChange={(e) => setDraft(e.target.value)}
+              onKeyDown={(e) => e.key === "Enter" && sendMessage()}
+            />
+            <Btn variant="primary" onClick={sendMessage}>Send</Btn>
+          </div>
+        </Modal>
+      )}
+    </React.Fragment>
   );
 }
