@@ -717,7 +717,7 @@ export default function App() {
           <InventoryTab catalog={catalog} setCatalog={persist.catalog} isOwner={isOwner} lowStockThreshold={lowStockThreshold} categories={categories} />
         )}
         {tab === "sales" && canVoidSales && (
-          <SalesTab sales={sales} setSales={persist.sales} catalog={catalog} setCatalog={persist.catalog} customerPackages={customerPackages} setCustomerPackages={persist.customerPackages} />
+          <SalesTab sales={sales} setSales={persist.sales} catalog={catalog} setCatalog={persist.catalog} customerPackages={customerPackages} setCustomerPackages={persist.customerPackages} customers={customers} currentUser={currentUser} />
         )}
         {tab === "staff" && (isOwner || hasAnyReportAccess(currentUser)) && (
           <StaffTab
@@ -2172,11 +2172,80 @@ function BackupRestore({ allData, onRestoreAll }) {
 }
 
 /* ---------- Sales Tab: view + void (owner, or staff granted permission) ---------- */
-function SalesTab({ sales, setSales, catalog, setCatalog, customerPackages, setCustomerPackages }) {
-  const [range, setRange] = useState(defaultRangeValue("last7"));
-  const [confirmVoid, setConfirmVoid] = useState(null);
+function SaleEditModal({ sale, customers, onSave, onClose }) {
+  const [customerId, setCustomerId] = useState(sale.customerId || "");
+  const [customerSearch, setCustomerSearch] = useState("");
+  const [paymentMethod, setPaymentMethod] = useState(sale.paymentMethod);
+  const isSplit = !!sale.paymentSplits;
 
-  const salesInRange = sales.filter((s) => inRange(s.date, range.start, range.end)).sort((a, b) => new Date(b.date) - new Date(a.date));
+  const filteredCustomers = customers.filter((c) => c.name.toLowerCase().indexOf(customerSearch.toLowerCase()) !== -1).slice(0, 30);
+
+  const submit = () => {
+    const customer = customers.find((c) => c.id === customerId);
+    onSave({
+      customerId: customer ? customer.id : null,
+      customerName: customer ? customer.name : "Walk-in",
+      paymentMethod: isSplit ? sale.paymentMethod : paymentMethod,
+    });
+  };
+
+  return (
+    <Modal title={"Edit sale — OR #" + sale.orNumber} onClose={onClose}>
+      <div style={{ fontSize: 12, color: MUTED, marginBottom: 12 }}>You can reassign the customer or fix the payment method. Items, prices, and totals can't be changed here — void and re-enter the sale if those are wrong.</div>
+      <Field label="Customer">
+        <input style={Object.assign({}, inputStyle, { marginBottom: 6 })} placeholder="Search by name (leave blank for Walk-in)" value={customerSearch} onChange={(e) => setCustomerSearch(e.target.value)} />
+        <select style={inputStyle} value={customerId} onChange={(e) => setCustomerId(e.target.value)}>
+          <option value="">Walk-in</option>
+          {filteredCustomers.map((c) => (<option key={c.id} value={c.id}>{c.name}</option>))}
+        </select>
+      </Field>
+      <Field label="Payment method" hint={isSplit ? "This sale used a split payment — edit the individual amounts isn't supported here." : undefined}>
+        <select style={inputStyle} value={paymentMethod} onChange={(e) => setPaymentMethod(e.target.value)} disabled={isSplit}>
+          <option>Cash</option><option>GCash</option><option>Card</option>
+        </select>
+      </Field>
+      <Btn variant="primary" style={{ width: "100%" }} onClick={submit}>Save changes</Btn>
+    </Modal>
+  );
+}
+
+function RevenueBarChart({ dayRows }) {
+  if (dayRows.length === 0) return <div style={{ fontSize: 13, color: MUTED }}>No sales yet.</div>;
+  const sorted = dayRows.slice().sort((a, b) => a[0].localeCompare(b[0]));
+  const max = Math.max.apply(null, sorted.map((r) => r[1]));
+  return (
+    <div style={{ display: "flex", alignItems: "flex-end", gap: 6, height: 140, padding: "10px 4px", overflowX: "auto" }}>
+      {sorted.map(([day, amt]) => {
+        const h = max > 0 ? Math.max(4, Math.round((amt / max) * 110)) : 4;
+        return (
+          <div key={day} title={fmtDate(day) + ": " + peso(amt)} style={{ display: "flex", flexDirection: "column", alignItems: "center", minWidth: 28 }}>
+            <div style={{ fontSize: 10, color: MUTED, marginBottom: 3 }}>{amt > 0 ? Math.round(amt / 1000) + "k" : ""}</div>
+            <div style={{ width: 18, height: h, background: GOLD, borderRadius: "3px 3px 0 0" }} />
+            <div style={{ fontSize: 9, color: MUTED, marginTop: 4, whiteSpace: "nowrap" }}>{new Date(day + "T00:00:00").toLocaleDateString("en-PH", { month: "short", day: "numeric" })}</div>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+function SalesTab({ sales, setSales, catalog, setCatalog, customerPackages, setCustomerPackages, customers, currentUser }) {
+  const [range, setRange] = useState(defaultRangeValue("last7"));
+  const [search, setSearch] = useState("");
+  const [confirmVoid, setConfirmVoid] = useState(null);
+  const [editingSale, setEditingSale] = useState(null);
+
+  const salesInRange = sales
+    .filter((s) => inRange(s.date, range.start, range.end))
+    .filter((s) => {
+      if (!search.trim()) return true;
+      const q = search.trim().toLowerCase();
+      const inCustomer = (s.customerName || "").toLowerCase().indexOf(q) !== -1;
+      const inItems = s.items.some((i) => i.name.toLowerCase().indexOf(q) !== -1);
+      const inOr = String(s.orNumber || "").indexOf(q) !== -1;
+      return inCustomer || inItems || inOr;
+    })
+    .sort((a, b) => new Date(b.date) - new Date(a.date));
 
   const voidSale = (sale) => {
     setCatalog(catalog.map((c) => {
@@ -2194,28 +2263,43 @@ function SalesTab({ sales, setSales, catalog, setCatalog, customerPackages, setC
     setSales(sales.map((s) => (s.id === sale.id ? Object.assign({}, s, { voided: true, voidedAt: new Date().toISOString() }) : s)));
   };
 
+  const saveSaleEdit = (changes) => {
+    const before = editingSale;
+    const changeNotes = [];
+    if (changes.customerName !== before.customerName) changeNotes.push("customer: " + before.customerName + " → " + changes.customerName);
+    if (changes.paymentMethod !== before.paymentMethod) changeNotes.push("payment: " + before.paymentMethod + " → " + changes.paymentMethod);
+    const historyEntry = { editedAt: new Date().toISOString(), editedBy: currentUser.name, note: changeNotes.join("; ") || "no changes" };
+    setSales(sales.map((s) => (s.id === before.id ? Object.assign({}, s, changes, { edited: true, editHistory: (s.editHistory || []).concat([historyEntry]) }) : s)));
+    setEditingSale(null);
+  };
+
   return (
     <div>
-      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 14, flexWrap: "wrap", gap: 10 }}>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 10, flexWrap: "wrap", gap: 10 }}>
         <div style={{ fontWeight: 700 }}>Sales</div>
         <DateRangeFilter value={range} onChange={setRange} />
       </div>
+      <input style={Object.assign({}, inputStyle, { marginBottom: 14 })} placeholder="Search by customer, item, or OR #" value={search} onChange={(e) => setSearch(e.target.value)} />
       <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
-        {salesInRange.length === 0 && <div style={{ fontSize: 13, color: MUTED }}>No sales in this range.</div>}
+        {salesInRange.length === 0 && <div style={{ fontSize: 13, color: MUTED }}>No sales match.</div>}
         {salesInRange.map((s) => (
           <div key={s.id} style={{ background: CARD, border: "1px solid " + LINE, borderRadius: 10, padding: "10px 14px", display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 8, opacity: s.voided ? 0.55 : 1 }}>
             <div>
-              <div style={{ fontWeight: 600, fontSize: 13 }}>OR #{s.orNumber} · {new Date(s.date).toLocaleString("en-PH")} · {s.customerName} {s.voided && <Badge text="voided" color={RUST} />}</div>
+              <div style={{ fontWeight: 600, fontSize: 13 }}>OR #{s.orNumber} · {new Date(s.date).toLocaleString("en-PH")} · {s.customerName} {s.voided && <Badge text="voided" color={RUST} />} {s.edited && <Badge text="edited" color={GOLD} />}</div>
               <div style={{ fontSize: 12, color: MUTED }}>{s.items.map((i) => i.qty + "x " + i.name + (i.staffName ? " (" + i.staffName + ")" : "")).join(", ")} · {s.paymentMethod}</div>
               <div style={{ fontSize: 12, color: MUTED }}>Encoded by {s.processedBy || "—"}</div>
             </div>
             <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
               <div style={{ fontWeight: 700, fontSize: 13 }}>{peso(s.total)}</div>
+              {!s.voided && <Btn onClick={() => setEditingSale(s)}>Edit</Btn>}
               {!s.voided && <Btn variant="danger" onClick={() => setConfirmVoid(s)}>Void</Btn>}
             </div>
           </div>
         ))}
       </div>
+      {editingSale && (
+        <SaleEditModal sale={editingSale} customers={customers} onSave={saveSaleEdit} onClose={() => setEditingSale(null)} />
+      )}
       {confirmVoid && (
         <ConfirmModal
           title="Void this sale?"
@@ -2404,6 +2488,7 @@ function StaffTab({ staff, setStaff, sales, catalog, expenses, setExpenses, sett
           {canRevenueByDay && (
             <div>
               <div style={{ fontWeight: 700, fontSize: 13, marginBottom: 8 }}>Revenue by day</div>
+              {currentUser.role === "owner" && <RevenueBarChart dayRows={dayRows} />}
               <div style={{ display: "flex", flexDirection: "column", gap: 4, maxHeight: 200, overflowY: "auto" }}>
                 {dayRows.length === 0 && <div style={{ fontSize: 13, color: MUTED }}>No sales yet.</div>}
                 {dayRows.map(([day, amt]) => (
