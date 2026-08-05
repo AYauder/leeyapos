@@ -2233,7 +2233,9 @@ function SalesTab({ sales, setSales, catalog, setCatalog, customerPackages, setC
   const [range, setRange] = useState(defaultRangeValue("last7"));
   const [search, setSearch] = useState("");
   const [confirmVoid, setConfirmVoid] = useState(null);
+  const [confirmDelete, setConfirmDelete] = useState(null);
   const [editingSale, setEditingSale] = useState(null);
+  const isOwner = currentUser.role === "owner";
 
   const salesInRange = sales
     .filter((s) => inRange(s.date, range.start, range.end))
@@ -2261,6 +2263,10 @@ function SalesTab({ sales, setSales, catalog, setCatalog, customerPackages, setC
     });
     setCustomerPackages(updatedPackages);
     setSales(sales.map((s) => (s.id === sale.id ? Object.assign({}, s, { voided: true, voidedAt: new Date().toISOString() }) : s)));
+  };
+
+  const deleteVoidedSale = (sale) => {
+    setSales(sales.filter((s) => s.id !== sale.id));
   };
 
   const saveSaleEdit = (changes) => {
@@ -2293,6 +2299,7 @@ function SalesTab({ sales, setSales, catalog, setCatalog, customerPackages, setC
               <div style={{ fontWeight: 700, fontSize: 13 }}>{peso(s.total)}</div>
               {!s.voided && <Btn onClick={() => setEditingSale(s)}>Edit</Btn>}
               {!s.voided && <Btn variant="danger" onClick={() => setConfirmVoid(s)}>Void</Btn>}
+              {s.voided && isOwner && <Btn variant="danger" onClick={() => setConfirmDelete(s)}>Delete permanently</Btn>}
             </div>
           </div>
         ))}
@@ -2307,6 +2314,15 @@ function SalesTab({ sales, setSales, catalog, setCatalog, customerPackages, setC
           confirmLabel="Void sale"
           onConfirm={() => { voidSale(confirmVoid); setConfirmVoid(null); }}
           onClose={() => setConfirmVoid(null)}
+        />
+      )}
+      {confirmDelete && (
+        <ConfirmModal
+          title="Permanently delete this voided sale?"
+          body={"OR #" + confirmDelete.orNumber + " · " + confirmDelete.customerName + " · " + peso(confirmDelete.total) + " — this removes the record completely from your sales history and reports. It will not appear even in a future data backup taken after this."}
+          confirmLabel="Delete permanently"
+          onConfirm={() => { deleteVoidedSale(confirmDelete); setConfirmDelete(null); }}
+          onClose={() => setConfirmDelete(null)}
         />
       )}
     </div>
