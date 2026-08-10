@@ -4,6 +4,9 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1, user-scalable=no" />
     <title>Leeya Beauty Lounge — POS</title>
+    <!-- Face recognition library for the Time In / Out clock. Loaded globally
+         (not via npm) so it's available as window.faceapi before React mounts. -->
+    <script defer src="https://cdn.jsdelivr.net/npm/@vladmandic/face-api@1.7.15/dist/face-api.js"></script>
   </head>
   <body style="margin:0;">
     <div id="root"></div>
