@@ -284,6 +284,95 @@ const KEYS = {
   presence: "leeya:presence",
 };
 
+/* ---------- Leeya Kaizen App integration: Face ID time clock ----------
+   Kaizen App stores its data as one JSON document in a Supabase table
+   called "kaizen_state" (row id = "main"), in the SAME Supabase project
+   this POS app uses. Staff identity, PINs, and roles for the two apps
+   are intentionally kept separate (POS has its own posAccess/commission
+   fields), but attendance is NOT duplicated: the Face ID clock below
+   reads enrolled faces from Kaizen's staff list and writes stamps
+   straight into Kaizen's own attendance array, so Kaizen App remains the
+   single source of truth for attendance — POS never keeps its own copy. */
+const KAIZEN_TABLE = "kaizen_state";
+const FACE_MATCH_THRESHOLD = 0.5; // lower = stricter. 0.5 is face-api.js's own recommended cutoff.
+const FACE_MATCH_MARGIN = 0.04; // if the 2nd-closest face is within this margin of the best match, treat as ambiguous rather than guess
+
+function euclideanDistance(a, b) {
+  let sum = 0;
+  for (let i = 0; i < a.length; i++) sum += (a[i] - b[i]) * (a[i] - b[i]);
+  return Math.sqrt(sum);
+}
+
+let faceModelsLoaded = false;
+function waitForFaceApi(timeoutMs) {
+  timeoutMs = timeoutMs || 10000;
+  return new Promise((resolve, reject) => {
+    const start = Date.now();
+    (function check() {
+      if (window.faceapi) return resolve();
+      if (Date.now() - start > timeoutMs) return reject(new Error("face-api.js did not load in time"));
+      setTimeout(check, 120);
+    })();
+  });
+}
+async function ensureFaceModels() {
+  if (faceModelsLoaded) return;
+  await waitForFaceApi();
+  const MODEL_URL = "https://cdn.jsdelivr.net/npm/@vladmandic/face-api@1.7.15/model";
+  await window.faceapi.nets.tinyFaceDetector.loadFromUri(MODEL_URL);
+  await window.faceapi.nets.faceLandmark68Net.loadFromUri(MODEL_URL);
+  await window.faceapi.nets.faceRecognitionNet.loadFromUri(MODEL_URL);
+  faceModelsLoaded = true;
+}
+
+function kzDateStr(d) {
+  const y = d.getFullYear(), m = String(d.getMonth() + 1).padStart(2, "0"), day = String(d.getDate()).padStart(2, "0");
+  return y + "-" + m + "-" + day;
+}
+function kzTimeStr(d) {
+  return String(d.getHours()).padStart(2, "0") + ":" + String(d.getMinutes()).padStart(2, "0");
+}
+
+// Staff enrolled for Face ID in Kaizen App (active + has a saved face descriptor)
+async function loadKaizenFaces() {
+  const { data, error } = await supabase.from(KAIZEN_TABLE).select("data").eq("id", "main").maybeSingle();
+  if (error) throw error;
+  const staffList = (data && data.data && data.data.staff) || [];
+  return staffList.filter((s) => s.active !== false && Array.isArray(s.faceDescriptor) && s.faceDescriptor.length === 128);
+}
+
+// Reads the freshest copy right before writing (small race window, not a full lock,
+// but far safer than writing a stale in-memory copy of the whole Kaizen document).
+// Returns "in" | "out" | "already-complete".
+async function stampKaizenAttendance(staffId) {
+  const { data, error } = await supabase.from(KAIZEN_TABLE).select("data").eq("id", "main").maybeSingle();
+  if (error) throw error;
+  const doc = (data && data.data) ? data.data : {};
+  const attendance = Array.isArray(doc.attendance) ? doc.attendance.slice() : [];
+  const today = kzDateStr(new Date());
+  const t = kzTimeStr(new Date());
+  const idx = attendance.findIndex((a) => a.staffId === staffId && a.date === today);
+  let outcome;
+  if (idx === -1) {
+    attendance.push({
+      id: "att_" + Date.now().toString(36) + Math.random().toString(36).slice(2, 7),
+      staffId, date: today, timeIn: t, timeOut: null,
+      stampedBy: staffId, note: "Face ID time clock (Leeya POS App)",
+      editHistory: [], source: "pos_face",
+    });
+    outcome = "in";
+  } else if (!attendance[idx].timeOut) {
+    attendance[idx] = Object.assign({}, attendance[idx], { timeOut: t });
+    outcome = "out";
+  } else {
+    outcome = "already-complete";
+  }
+  doc.attendance = attendance;
+  const { error: upErr } = await supabase.from(KAIZEN_TABLE).upsert({ id: "main", data: doc, updated_at: new Date().toISOString() });
+  if (upErr) throw upErr;
+  return outcome;
+}
+
 /* ---------- persistence: Supabase + offline retry queue + conflict detection ---------- */
 const lastKnownUpdatedAt = {}; // key -> ISO timestamp of the value we last read/wrote successfully
 const pendingWrites = {}; // key -> value still waiting to reach the server
@@ -614,7 +703,7 @@ export default function App() {
 
   if (loading) return <div style={{ padding: 60, textAlign: "center", color: MUTED, fontFamily: "sans-serif" }}>Loading Leeya POS…</div>;
 
-  if (!currentUser) return <Login staff={staff} onLogin={setCurrentUser} />;
+  if (!currentUser) return <EntryGate staff={staff} onLogin={setCurrentUser} />;
 
   const today = todayStr();
   if (!cashDrawer[today]) {
@@ -737,7 +826,7 @@ export default function App() {
 }
 
 /* ---------- Login ---------- */
-function Login({ staff, onLogin }) {
+function Login({ staff, onLogin, onBack }) {
   const [picked, setPicked] = useState(null);
   const [pin, setPin] = useState("");
   const [err, setErr] = useState("");
@@ -807,6 +896,140 @@ function Login({ staff, onLogin }) {
           )}
         </div>
         <div style={{ textAlign: "center", fontSize: 11, color: MUTED, marginTop: 14 }}>Default owner PIN is 1234 — change it under Staff & Settings.</div>
+        {onBack && !picked && (
+          <div style={{ textAlign: "center", marginTop: 10 }}>
+            <button onClick={onBack} style={{ background: "none", border: "none", color: MUTED, fontSize: 12, cursor: "pointer", textDecoration: "underline" }}>&larr; Back</button>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+/* ================= ENTRY CHOOSER: Login to POS vs Time In/Out (Face ID) ================= */
+function EntryGate({ staff, onLogin }) {
+  const [mode, setMode] = useState(null); // null | "login" | "clock"
+  if (mode === "login") return <Login staff={staff} onLogin={onLogin} onBack={() => setMode(null)} />;
+  if (mode === "clock") return <TimeClock onBack={() => setMode(null)} />;
+  return (
+    <div style={{ minHeight: "100vh", background: BG, display: "flex", alignItems: "center", justifyContent: "center", fontFamily: "-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" }}>
+      <FontImport />
+      <div style={{ width: 340, maxWidth: "90vw", textAlign: "center" }}>
+        <Logo size={34} />
+        <div style={{ fontSize: 13, color: MUTED, marginTop: 2, marginBottom: 26 }}>Beauty Lounge · Balanga City Branch</div>
+        <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+          <Btn variant="primary" onClick={() => setMode("login")} style={{ padding: "16px 0", fontSize: 15 }}>Login to POS</Btn>
+          <Btn onClick={() => setMode("clock")} style={{ padding: "16px 0", fontSize: 15 }}>Time In / Out (Face ID)</Btn>
+        </div>
+        <div style={{ fontSize: 11, color: MUTED, marginTop: 18 }}>Face ID is enrolled per staff member in Leeya Kaizen App, under My Profile.</div>
+      </div>
+    </div>
+  );
+}
+
+/* ================= TIME CLOCK: face recognition time in/out ================= */
+function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
+
+function TimeClock({ onBack }) {
+  const videoRef = useRef(null);
+  const [phase, setPhase] = useState("loading"); // loading | scanning | stamping | success | notfound | error
+  const [message, setMessage] = useState("Starting camera…");
+  const [resultName, setResultName] = useState("");
+
+  useEffect(() => {
+    let stream = null;
+    let stopped = false;
+    const matchStreak = { id: null, count: 0 };
+
+    async function handleMatch(staffMember) {
+      stopped = true;
+      setPhase("stamping");
+      setResultName(staffMember.name);
+      setMessage("Saving attendance…");
+      try {
+        const outcome = await stampKaizenAttendance(staffMember.id);
+        setPhase("success");
+        setMessage(outcome === "in" ? "Timed IN" : outcome === "out" ? "Timed OUT" : "Already complete for today");
+      } catch (e) {
+        console.error(e);
+        setPhase("error");
+        setMessage("Could not save attendance — check your connection and try again.");
+      }
+      if (stream) stream.getTracks().forEach((t) => t.stop());
+      setTimeout(onBack, 2500);
+    }
+
+    async function runLoop(enrolledStaff) {
+      while (!stopped) {
+        try {
+          const det = await window.faceapi
+            .detectSingleFace(videoRef.current, new window.faceapi.TinyFaceDetectorOptions())
+            .withFaceLandmarks()
+            .withFaceDescriptor();
+          if (det && !stopped) {
+            let best = null, bestDist = Infinity, secondDist = Infinity;
+            for (const s of enrolledStaff) {
+              const d = euclideanDistance(det.descriptor, s.faceDescriptor);
+              if (d < bestDist) { secondDist = bestDist; bestDist = d; best = s; }
+              else if (d < secondDist) { secondDist = d; }
+            }
+            const ambiguous = (secondDist - bestDist) < FACE_MATCH_MARGIN;
+            if (best && bestDist < FACE_MATCH_THRESHOLD && !ambiguous) {
+              if (matchStreak.id === best.id) matchStreak.count++;
+              else { matchStreak.id = best.id; matchStreak.count = 1; }
+              setMessage("Recognized " + best.name + "…");
+              if (matchStreak.count >= 2) { await handleMatch(best); break; }
+            } else {
+              matchStreak.id = null; matchStreak.count = 0;
+              setMessage(enrolledStaff.length ? "Look at the camera…" : "No one has enrolled Face ID yet — set this up in Leeya Kaizen App under My Profile.");
+            }
+          }
+        } catch (e) { /* skip a bad frame, keep scanning */ }
+        await sleep(350);
+      }
+    }
+
+    (async () => {
+      try {
+        await ensureFaceModels();
+        const enrolledStaff = await loadKaizenFaces();
+        stream = await navigator.mediaDevices.getUserMedia({ video: { width: 480, height: 480, facingMode: "user" } });
+        if (stopped) { stream.getTracks().forEach((t) => t.stop()); return; }
+        if (videoRef.current) { videoRef.current.srcObject = stream; await videoRef.current.play(); }
+        setPhase("scanning");
+        setMessage(enrolledStaff.length ? "Look at the camera…" : "No one has enrolled Face ID yet — set this up in Leeya Kaizen App under My Profile.");
+        runLoop(enrolledStaff);
+      } catch (e) {
+        console.error(e);
+        setPhase("error");
+        setMessage(e && e.name === "NotAllowedError" ? "Camera access was blocked. Allow camera access in your browser and try again." : "Could not start the camera on this device.");
+      }
+    })();
+
+    return () => {
+      stopped = true;
+      if (stream) stream.getTracks().forEach((t) => t.stop());
+    };
+  }, []);
+
+  const color = phase === "error" ? RUST : phase === "success" ? SAGE : INK;
+
+  return (
+    <div style={{ minHeight: "100vh", background: BG, display: "flex", alignItems: "center", justifyContent: "center", fontFamily: "-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" }}>
+      <FontImport />
+      <div style={{ width: 380, maxWidth: "92vw", textAlign: "center" }}>
+        <Logo size={30} />
+        <div style={{ fontSize: 13, color: MUTED, marginTop: 2, marginBottom: 18 }}>Face ID Time Clock</div>
+        <div style={{ background: CARD, borderRadius: 14, padding: 16, border: "1px solid " + LINE }}>
+          <div style={{ position: "relative", width: "100%", aspectRatio: "1 / 1", borderRadius: 10, overflow: "hidden", background: "#000" }}>
+            <video ref={videoRef} muted playsInline style={{ width: "100%", height: "100%", objectFit: "cover", transform: "scaleX(-1)" }} />
+          </div>
+          <div style={{ marginTop: 14, fontWeight: 700, color }}>
+            {resultName ? resultName + " — " + message : message}
+          </div>
+          <Btn onClick={onBack} style={{ marginTop: 14, width: "100%" }}>Cancel</Btn>
+        </div>
+        <div style={{ fontSize: 11, color: MUTED, marginTop: 12 }}>Not recognized? Ask an Owner/Manager to enroll your Face ID in Leeya Kaizen App under My Profile.</div>
       </div>
     </div>
   );
