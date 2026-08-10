@@ -344,6 +344,11 @@ async function loadKaizenFaces() {
 // Reads the freshest copy right before writing (small race window, not a full lock,
 // but far safer than writing a stale in-memory copy of the whole Kaizen document).
 // Returns "in" | "out" | "already-complete".
+const MIN_STAMP_INTERVAL_MIN = 60; // require at least this many minutes between a time-in and its time-out
+function kzMinutesOfDay(hhmm) { const [h, m] = hhmm.split(":").map(Number); return h * 60 + m; }
+
+// Returns { outcome, timeIn?, minutesRemaining? } where outcome is one of:
+// "in" | "out" | "already-complete" | "too-soon"
 async function stampKaizenAttendance(staffId) {
   const { data, error } = await supabase.from(KAIZEN_TABLE).select("data").eq("id", "main").maybeSingle();
   if (error) throw error;
@@ -352,7 +357,6 @@ async function stampKaizenAttendance(staffId) {
   const today = kzDateStr(new Date());
   const t = kzTimeStr(new Date());
   const idx = attendance.findIndex((a) => a.staffId === staffId && a.date === today);
-  let outcome;
   if (idx === -1) {
     attendance.push({
       id: "att_" + Date.now().toString(36) + Math.random().toString(36).slice(2, 7),
@@ -360,17 +364,27 @@ async function stampKaizenAttendance(staffId) {
       stampedBy: staffId, note: "Face ID time clock (Leeya POS App)",
       editHistory: [], source: "pos_face",
     });
-    outcome = "in";
-  } else if (!attendance[idx].timeOut) {
-    attendance[idx] = Object.assign({}, attendance[idx], { timeOut: t });
-    outcome = "out";
-  } else {
-    outcome = "already-complete";
+    doc.attendance = attendance;
+    const { error: upErr } = await supabase.from(KAIZEN_TABLE).upsert({ id: "main", data: doc, updated_at: new Date().toISOString() });
+    if (upErr) throw upErr;
+    return { outcome: "in" };
   }
-  doc.attendance = attendance;
-  const { error: upErr } = await supabase.from(KAIZEN_TABLE).upsert({ id: "main", data: doc, updated_at: new Date().toISOString() });
-  if (upErr) throw upErr;
-  return outcome;
+  if (!attendance[idx].timeOut) {
+    // Guard against the camera catching the same person again moments after
+    // they timed in (e.g. lingering near the register) and mistaking it for
+    // a time-out. Require a minimum gap before a time-out is accepted.
+    const prevTimeIn = attendance[idx].timeIn;
+    const elapsed = prevTimeIn ? (kzMinutesOfDay(t) - kzMinutesOfDay(prevTimeIn)) : MIN_STAMP_INTERVAL_MIN;
+    if (elapsed < MIN_STAMP_INTERVAL_MIN) {
+      return { outcome: "too-soon", timeIn: prevTimeIn, minutesRemaining: Math.max(1, MIN_STAMP_INTERVAL_MIN - elapsed) };
+    }
+    attendance[idx] = Object.assign({}, attendance[idx], { timeOut: t });
+    doc.attendance = attendance;
+    const { error: upErr } = await supabase.from(KAIZEN_TABLE).upsert({ id: "main", data: doc, updated_at: new Date().toISOString() });
+    if (upErr) throw upErr;
+    return { outcome: "out" };
+  }
+  return { outcome: "already-complete" };
 }
 
 /* ---------- persistence: Supabase + offline retry queue + conflict detection ---------- */
@@ -947,16 +961,24 @@ function TimeClock({ onBack }) {
       setResultName(staffMember.name);
       setMessage("Saving attendance…");
       try {
-        const outcome = await stampKaizenAttendance(staffMember.id);
-        setPhase("success");
-        setMessage(outcome === "in" ? "Timed IN" : outcome === "out" ? "Timed OUT" : "Already complete for today");
+        const result = await stampKaizenAttendance(staffMember.id);
+        if (result.outcome === "too-soon") {
+          setPhase("toosoon");
+          setMessage("Already timed in at " + result.timeIn + ". Please wait about " + result.minutesRemaining + " more minute(s) before timing out.");
+        } else if (result.outcome === "in") {
+          setPhase("success"); setMessage("Timed IN");
+        } else if (result.outcome === "out") {
+          setPhase("success"); setMessage("Timed OUT");
+        } else {
+          setPhase("success"); setMessage("Already complete for today");
+        }
       } catch (e) {
         console.error(e);
         setPhase("error");
         setMessage("Could not save attendance — check your connection and try again.");
       }
       if (stream) stream.getTracks().forEach((t) => t.stop());
-      setTimeout(onBack, 2500);
+      setTimeout(onBack, 2800);
     }
 
     async function runLoop(enrolledStaff) {
@@ -1012,7 +1034,7 @@ function TimeClock({ onBack }) {
     };
   }, []);
 
-  const color = phase === "error" ? RUST : phase === "success" ? SAGE : INK;
+  const color = phase === "error" ? RUST : phase === "success" ? SAGE : phase === "toosoon" ? GOLD : INK;
 
   return (
     <div style={{ minHeight: "100vh", background: BG, display: "flex", alignItems: "center", justifyContent: "center", fontFamily: "-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif" }}>
