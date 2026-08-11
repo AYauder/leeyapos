@@ -294,7 +294,7 @@ const KEYS = {
    straight into Kaizen's own attendance array, so Kaizen App remains the
    single source of truth for attendance — POS never keeps its own copy. */
 const KAIZEN_TABLE = "kaizen_state";
-const FACE_MATCH_THRESHOLD = 0.5; // lower = stricter. 0.5 is face-api.js's own recommended cutoff.
+const FACE_MATCH_THRESHOLD = 0.55; // lower = stricter. 0.5 is face-api.js's textbook cutoff; nudged up slightly since a small team can tolerate a bit more leniency in exchange for fewer failed scans.
 const FACE_MATCH_MARGIN = 0.04; // if the 2nd-closest face is within this margin of the best match, treat as ambiguous rather than guess
 
 function euclideanDistance(a, b) {
@@ -304,6 +304,12 @@ function euclideanDistance(a, b) {
 }
 
 let faceModelsLoaded = false;
+function faceDetectorOptions() {
+  // Larger inputSize + a lower score threshold than the library default
+  // catches faces more reliably under real-world lighting/angles/camera
+  // quality on shop-floor devices, at a small extra compute cost per frame.
+  return new window.faceapi.TinyFaceDetectorOptions({ inputSize: 512, scoreThreshold: 0.4 });
+}
 function waitForFaceApi(timeoutMs) {
   timeoutMs = timeoutMs || 10000;
   return new Promise((resolve, reject) => {
@@ -985,7 +991,7 @@ function TimeClock({ onBack }) {
       while (!stopped) {
         try {
           const det = await window.faceapi
-            .detectSingleFace(videoRef.current, new window.faceapi.TinyFaceDetectorOptions())
+            .detectSingleFace(videoRef.current, faceDetectorOptions())
             .withFaceLandmarks()
             .withFaceDescriptor();
           if (det && !stopped) {
@@ -1003,8 +1009,13 @@ function TimeClock({ onBack }) {
               if (matchStreak.count >= 2) { await handleMatch(best); break; }
             } else {
               matchStreak.id = null; matchStreak.count = 0;
-              setMessage(enrolledStaff.length ? "Look at the camera…" : "No one has enrolled Face ID yet — set this up in Leeya Kaizen App under My Profile.");
+              if (!enrolledStaff.length) setMessage("No one has enrolled Face ID yet — set this up in Leeya Kaizen App under My Profile.");
+              else if (best) setMessage("Face detected, but not a confident match — hold still, face the light, and stay centered.");
+              else setMessage("Face detected — hold still…");
             }
+          } else if (!stopped) {
+            matchStreak.id = null; matchStreak.count = 0;
+            setMessage(enrolledStaff.length ? "No face detected — move closer and face the camera directly." : "No one has enrolled Face ID yet — set this up in Leeya Kaizen App under My Profile.");
           }
         } catch (e) { /* skip a bad frame, keep scanning */ }
         await sleep(350);
